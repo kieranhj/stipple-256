@@ -43,10 +43,16 @@ from PIL import Image
 # image / tone prep
 # --------------------------------------------------------------------------
 
-def load_darkness(path, W, H, gamma, black_point, white_point):
-    """Load an image, fit it to WxH (centre crop), return darkness in [0,1]."""
-    img = Image.open(path).convert("L")
-    img = _fit_crop(img, W, H)
+def load_darkness(path, W, H, gamma, black_point, white_point, fit="cover"):
+    """Load an image, fit it to WxH, return darkness in [0,1]."""
+    img = Image.open(path)
+    if img.mode in ("RGBA", "LA", "P"):
+        # flatten any transparency onto white so it reads as background
+        img = img.convert("RGBA")
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, img)
+    img = img.convert("L")
+    img = _fit(img, W, H, fit)
     lum = np.asarray(img, dtype=np.float64) / 255.0
 
     # clamp the tonal window, then gamma. white_point maps to white (0 dark),
@@ -58,9 +64,17 @@ def load_darkness(path, W, H, gamma, black_point, white_point):
     return dark
 
 
-def _fit_crop(img, W, H):
-    """Scale to cover WxH preserving aspect, then centre-crop to WxH."""
+def _fit(img, W, H, fit):
+    """Fit to WxH. 'cover' = scale-to-fill + centre-crop; 'contain' = whole
+    image letterboxed onto a white WxH canvas."""
     sw, sh = img.size
+    if fit == "contain":
+        scale = min(W / sw, H / sh)
+        nw, nh = max(1, round(sw * scale)), max(1, round(sh * scale))
+        small = img.resize((nw, nh), Image.LANCZOS)
+        canvas = Image.new("L", (W, H), 255)        # white background
+        canvas.paste(small, ((W - nw) // 2, (H - nh) // 2))
+        return canvas
     scale = max(W / sw, H / sh)
     nw, nh = max(1, round(sw * scale)), max(1, round(sh * scale))
     img = img.resize((nw, nh), Image.LANCZOS)
@@ -289,6 +303,8 @@ def main():
     ap.add_argument("--gamma", type=float, default=1.0, help="darkness gamma (>1 lightens mids)")
     ap.add_argument("--black-point", type=float, default=0.0)
     ap.add_argument("--white-point", type=float, default=1.0)
+    ap.add_argument("--fit", choices=["cover", "contain"], default="cover",
+                    help="cover=fill+crop (default), contain=whole image letterboxed")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("-o", "--outdir", default="stipple_out")
     ap.add_argument("--stem", default=None, help="output filename stem")
@@ -310,7 +326,8 @@ def main():
     stem = args.stem or Path(args.image).stem
     rng = np.random.default_rng(args.seed)
 
-    dark = load_darkness(args.image, W, H, args.gamma, args.black_point, args.white_point)
+    dark = load_darkness(args.image, W, H, args.gamma, args.black_point,
+                         args.white_point, args.fit)
 
     # precompute the pixel-centre grid and placement weights once
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float64)
