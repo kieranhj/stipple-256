@@ -40,8 +40,30 @@ and compressed-size estimates (naive vs. bucketed+delta, zlib & lzma).
 | `-l/--levels` | 8 | discrete radius levels (8 ⇒ 3 bits). |
 | `--radius-scale` | 1.0 | global dot-size multiplier; >1 increases overlap so darkest tones go solid black. |
 | `--gamma` | 1.0 | darkness gamma; >1 lightens midtones. |
+| `--brightness` | 0.0 | additive luminance lift, −1..1. |
+| `--contrast` | 1.0 | contrast about mid-grey; >1 punchier. |
+| `--posterize` | 0 | quantize luminance to N bands (0=off; try 4–6). |
 | `--black-point`/`--white-point` | 0/1 | clamp the tonal window before stippling. |
+| `--fit` | cover | `cover`=fill+crop, `contain`=whole image letterboxed (portraits). |
 | `--iters` | 30 | Lloyd relaxation passes. |
+| `--bbc` | off | also export the BBC delta stream and ZX02-compress it (see below). |
+
+## BBC Micro export
+
+`--bbc` writes `<stem>.bbc.bin` (the raw delta stream) and, if a `zx02`
+compressor is found, `<stem>.bbc.zx02` (what ships on disc), self-checking
+both round-trips. Build zx02 from `github.com/dmsc/zx02` and pass `--zx02 PATH`.
+
+```
+python3 tools/stipple.py photo.png -o out --fit contain --gamma 1.4 -n 1700 \
+    --bbc --zx02 /path/to/zx02
+python3 tools/verify_bbc.py out/photo.bbc.bin   # prove the BBC plotter logic
+```
+
+`verify_bbc.py` replays the stream through the exact MODE 4 address arithmetic
+used by `bbc/stipple.asm` and diffs against the renderer (expects 0 diffs).
+
+See **`docs/STIPPLE.md`** for the data format, the 6502 player, and status.
 
 ## How it works
 

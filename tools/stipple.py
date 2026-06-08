@@ -43,8 +43,17 @@ from PIL import Image
 # image / tone prep
 # --------------------------------------------------------------------------
 
-def load_darkness(path, W, H, gamma, black_point, white_point, fit="cover"):
-    """Load an image, fit it to WxH, return darkness in [0,1]."""
+def load_darkness(path, W, H, opts, fit="cover"):
+    """Load an image, fit it to WxH, apply tone preprocessing, return darkness.
+
+    Preprocessing order (all operate on luminance in [0,1]):
+      1. black/white point   - clamp/stretch the input tonal window
+      2. brightness          - additive lift/drop
+      3. contrast            - scale around mid-grey (0.5)
+      4. posterize           - quantize to N luminance bands (0 = off)
+    then darkness = 1 - luminance, and finally:
+      5. gamma               - darkness ** gamma (>1 lightens midtones)
+    """
     img = Image.open(path)
     if img.mode in ("RGBA", "LA", "P"):
         # flatten any transparency onto white so it reads as background
@@ -55,12 +64,17 @@ def load_darkness(path, W, H, gamma, black_point, white_point, fit="cover"):
     img = _fit(img, W, H, fit)
     lum = np.asarray(img, dtype=np.float64) / 255.0
 
-    # clamp the tonal window, then gamma. white_point maps to white (0 dark),
-    # black_point maps to black (1 dark).
-    lo, hi = black_point, white_point
+    lo, hi = opts.black_point, opts.white_point
     lum = np.clip((lum - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    lum = lum + opts.brightness
+    lum = (lum - 0.5) * opts.contrast + 0.5
+    lum = np.clip(lum, 0.0, 1.0)
+    if opts.posterize and opts.posterize >= 2:
+        n = opts.posterize
+        lum = np.round(lum * (n - 1)) / (n - 1)
+
     dark = 1.0 - lum
-    dark = np.power(dark, gamma)
+    dark = np.power(np.clip(dark, 0.0, 1.0), opts.gamma)
     return dark
 
 
@@ -215,6 +229,151 @@ def save_previews(dark, ink, outdir, stem, scale3=3):
 
 
 # --------------------------------------------------------------------------
+# BBC Micro data format (Phase 2)
+# --------------------------------------------------------------------------
+#
+# Stream layout (decompressed in RAM; ZX02-compressed on disc):
+#
+#   nbuckets : 1 byte
+#   repeat nbuckets:
+#       radius : 1 byte                  (1..levels-1)
+#       nlines : 1 byte                  (scanlines containing >=1 dot, 1..255)
+#       repeat nlines:
+#           y  : 1 byte                  (absolute, 0..255, ascending)
+#           n  : 1 byte                  (dots on this line, 1..255)
+#           repeat n:
+#               dx : delta-x from previous dot on the line (prevx resets to 0
+#                    each line). Escape coding: emit 0xFF for each whole 255,
+#                    then a final byte 0..254. So real dx = sum of bytes read
+#                    until a byte < 255.  (x range 0..319 needs >8 bits; this
+#                    keeps everything byte-sized and very ZX02-friendly.)
+#
+# Dot centres are clamped to [r, W-1-r] x [r, H-1-r] so discs never cross the
+# screen edge - the 6502 plotter then needs no clipping.
+
+def pack_bbc(points, radii, W, H, levels):
+    """Pack dots into the locked BBC delta-stream. Returns (bytes, kept_count)."""
+    # build the list of (radius, [(y, [x,...]), ...]) bucket-entries first, so
+    # nbuckets reflects any splitting of >255-line buckets.
+    entries = []
+    kept = 0
+    for r in range(1, levels):
+        sel = np.where(radii == r)[0]
+        if len(sel) == 0:
+            continue
+        # clamp centres so the disc stays on screen (no 6502 clipping needed)
+        bx = np.clip(np.round(points[sel, 0]).astype(int), r, W - 1 - r)
+        by = np.clip(np.round(points[sel, 1]).astype(int), r, H - 1 - r)
+        o = np.lexsort((bx, by))               # sort by y, then x
+        bx, by = bx[o], by[o]
+        lines = []
+        i = 0
+        while i < len(bx):
+            y = int(by[i])
+            xs_line = [int(bx[i])]
+            j = i + 1
+            while j < len(bx) and by[j] == y:
+                xs_line.append(int(bx[j]))
+                j += 1
+            assert len(xs_line) <= 255, "scanline has >255 dots (impossible at 320px)"
+            lines.append((y, xs_line))
+            kept += len(xs_line)
+            i = j
+        # split into <=255-line entries that share the radius
+        for s in range(0, len(lines), 255):
+            entries.append((r, lines[s:s + 255]))
+
+    out = bytearray()
+    assert len(entries) <= 255, "too many bucket-entries"
+    out.append(len(entries))
+    for r, lines in entries:
+        out.append(r)
+        out.append(len(lines))
+        for y, xs_line in lines:
+            out.append(y)
+            out.append(len(xs_line))
+            prevx = 0
+            for x in xs_line:
+                dx = x - prevx
+                while dx >= 255:
+                    out.append(255)
+                    dx -= 255
+                out.append(dx)
+                prevx = x
+    return bytes(out), kept
+
+
+def unpack_bbc(data):
+    """Reference decoder mirroring the 6502 logic. Returns list of (x,y,r)."""
+    dots = []
+    p = 0
+    nbuckets = data[p]; p += 1
+    for _ in range(nbuckets):
+        r = data[p]; p += 1
+        nlines = data[p]; p += 1
+        for _ in range(nlines):
+            y = data[p]; p += 1
+            n = data[p]; p += 1
+            x = 0
+            for _ in range(n):
+                dx = 0
+                b = data[p]; p += 1
+                dx += b
+                while b == 255:
+                    b = data[p]; p += 1
+                    dx += b
+                x += dx
+                dots.append((x, y, r))
+    return dots
+
+
+def bbc_export(points, radii, W, H, levels, outdir, stem, zx02_bin, log=True):
+    """Write the raw stream + zx02-compressed data, and verify both round-trips."""
+    import shutil
+    import subprocess
+
+    stream, kept = pack_bbc(points, radii, W, H, levels)
+    raw_path = outdir / f"{stem}.bbc.bin"
+    raw_path.write_bytes(stream)
+
+    # verify our own format decodes back to the right dot count
+    decoded = unpack_bbc(stream)
+    ok = len(decoded) == kept
+    if log:
+        print("\n=== BBC export ===")
+        print(f"raw delta stream         : {len(stream):8d} B   "
+              f"({len(stream)/max(kept,1):.2f} B/dot, {kept} dots)")
+        print(f"reference decode         : {'OK' if ok else 'MISMATCH'} "
+              f"({len(decoded)} dots)")
+
+    # zx02 compress (+ verify with the matching decompressor if available)
+    zx02 = shutil.which(zx02_bin) or (zx02_bin if Path(zx02_bin).exists() else None)
+    if zx02:
+        zpath = outdir / f"{stem}.bbc.zx02"
+        try:
+            subprocess.run([zx02, "-f", str(raw_path), str(zpath)],
+                           check=True, capture_output=True)
+            zsize = zpath.stat().st_size
+            if log:
+                print(f"zx02 compressed          : {zsize:8d} B   "
+                      f"<-- ships on disc  ({100*zsize/len(stream):.1f}% of raw)")
+            # round-trip via dzx02 if it sits next to zx02
+            dz = Path(zx02).with_name("dzx02")
+            if dz.exists():
+                rt = subprocess.run([str(dz), str(zpath)], capture_output=True)
+                if rt.returncode == 0 and rt.stdout == stream:
+                    if log: print("zx02 round-trip          : OK")
+                elif log:
+                    print("zx02 round-trip          : MISMATCH")
+        except subprocess.CalledProcessError as e:
+            if log: print(f"zx02 failed: {e.stderr.decode(errors='ignore')[:200]}")
+    elif log:
+        print(f"zx02 not found ('{zx02_bin}') - skipping compression. "
+              f"Build it from github.com/dmsc/zx02 and pass --zx02 PATH.")
+    return kept
+
+
+# --------------------------------------------------------------------------
 # data export + compression report
 # --------------------------------------------------------------------------
 
@@ -237,26 +396,8 @@ def export_and_report(points, radii, W, H, levels, outdir, stem):
     naive = bytearray()
     for i in range(n):
         naive += bytes((xs[i] & 0xFF, ys[i] & 0xFF, rs[i] & 0xFF))
-    # --- packing estimate B: bucket by radius, scanline-sort, delta x ------
-    packed = bytearray()
-    for r in range(1, levels):
-        sel = np.where(rs == r)[0]
-        if len(sel) == 0:
-            packed += bytes((0, 0))
-            continue
-        bx, by = xs[sel], ys[sel]
-        o = np.lexsort((bx, by))           # sort by y then x
-        bx, by = bx[o], by[o]
-        packed += bytes((len(sel) & 0xFF, (len(sel) >> 8) & 0xFF))
-        py = -1
-        for j in range(len(sel)):
-            if by[j] != py:                # new scanline: emit absolute y marker
-                packed += bytes((255, by[j] & 0xFF))
-                py = by[j]
-                prevx = 0
-            dx = bx[j] - prevx
-            packed += bytes((min(dx, 254) & 0xFF,))
-            prevx = bx[j]
+    # --- packing B: the real locked BBC delta-stream (see pack_bbc) --------
+    packed, _ = pack_bbc(points, radii, W, H, levels)
 
     def comp(b):
         return len(zlib.compress(bytes(b), 9)), len(lzma.compress(bytes(b)))
@@ -300,14 +441,26 @@ def main():
                     help="placement weight exp: 0=even spacing(size-led, default), higher=cluster in shadows (toward classic stippling)")
     ap.add_argument("--radius-scale", type=float, default=1.0, help="global dot-size multiplier")
     ap.add_argument("--iters", type=int, default=30, help="Lloyd relaxation iterations")
+    # --- tone preprocessing ---
     ap.add_argument("--gamma", type=float, default=1.0, help="darkness gamma (>1 lightens mids)")
-    ap.add_argument("--black-point", type=float, default=0.0)
-    ap.add_argument("--white-point", type=float, default=1.0)
+    ap.add_argument("--brightness", type=float, default=0.0,
+                    help="additive luminance lift, -1..1 (positive = brighter = fewer/smaller dots)")
+    ap.add_argument("--contrast", type=float, default=1.0,
+                    help="luminance contrast about mid-grey (1=none, >1 punchier)")
+    ap.add_argument("--posterize", type=int, default=0,
+                    help="quantize luminance to N bands before stippling (0=off, e.g. 4-6 for poster look)")
+    ap.add_argument("--black-point", type=float, default=0.0,
+                    help="input luminance mapped to full black (0..1)")
+    ap.add_argument("--white-point", type=float, default=1.0,
+                    help="input luminance mapped to full white (0..1)")
     ap.add_argument("--fit", choices=["cover", "contain"], default="cover",
                     help="cover=fill+crop (default), contain=whole image letterboxed")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("-o", "--outdir", default="stipple_out")
     ap.add_argument("--stem", default=None, help="output filename stem")
+    ap.add_argument("--bbc", action="store_true",
+                    help="also export BBC Micro delta-stream data and zx02-compress it")
+    ap.add_argument("--zx02", default="zx02", help="path to the zx02 compressor binary")
     ap.add_argument("--make-test-image", metavar="PATH", default=None,
                     help="write a synthetic test image to PATH and use it")
     ap.add_argument("-q", "--quiet", action="store_true")
@@ -326,8 +479,7 @@ def main():
     stem = args.stem or Path(args.image).stem
     rng = np.random.default_rng(args.seed)
 
-    dark = load_darkness(args.image, W, H, args.gamma, args.black_point,
-                         args.white_point, args.fit)
+    dark = load_darkness(args.image, W, H, args, args.fit)
 
     # precompute the pixel-centre grid and placement weights once
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float64)
@@ -347,6 +499,9 @@ def main():
     ink = render(pts, radii, W, H, args.levels)
     save_previews(dark, ink, outdir, stem)
     n = export_and_report(pts, radii, W, H, args.levels, outdir, stem)
+    if args.bbc:
+        bbc_export(pts, radii, W, H, args.levels, outdir, stem, args.zx02,
+                   log=True)
 
     # radius histogram + fidelity
     hist = np.bincount(radii, minlength=args.levels)
