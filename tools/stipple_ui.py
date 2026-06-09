@@ -104,6 +104,7 @@ RADIUS_PRESETS = {
     "cell (earlier smaller: 0,1,2,3)": [0, 1, 2, 3],
     "wide (0,2,4,7)": [0, 2, 4, 7],
     "binary (0,0,4,4)": [0, 0, 4, 4],
+    "exp (0,5,13,29)": [0, 5, 13, 29],
     "custom": None,
 }
 
@@ -118,24 +119,64 @@ def _parse_lut(text, levels):
         vals = [0]
     while len(vals) < levels:
         vals.append(vals[-1])
-    return [max(0, min(15, v)) for v in vals[:levels]]
+    return [max(0, min(63, v)) for v in vals[:levels]]
 
 
-def _render_bbc(dark, size, levels, dots, radius_lut):
-    """Faithful preview of the on-device algorithm with an explicit radius LUT.
+DITHER_MODES = ["none", "floyd-steinberg", "ordered (4×4 bayer)"]
 
-    Differs from stipple.mode256_render in two ways:
-      * radius comes from the *cell* (after the darkness inversion the BBC
-        applies offline), not from `(255 - cell_lum) >> 5`, so what you see
-        here matches the actual `r = LUT[cell]` the assembly executes.
-      * the cell lookup uses (y * size) // 256 / (x * size) // 256, matching
-        the device's `(py & $F0) | (px >> 4)` for size=16 and the more general
-        formula for other sizes.
+
+def _downsample_dither(dark, size, levels, mode):
+    """Downsample dark->size×size and quantise to `levels` with optional dither.
+
+    Returns a uint8 grid in [0, levels-1] encoding *luminance* (0=dark, L-1=light)
+    — same convention as stipple.downsample_posterize, so the BBC packer's
+    `cells_dev = (L-1) - cells` darkness flip still applies downstream.
+
+    Dither is computed in luminance space (operating on the LANCZOS-downsampled
+    floats), then quantised. F-S diffuses the per-cell quantisation error onto
+    its 4 future neighbours; Bayer adds a fixed 4×4 threshold pattern. Both
+    spread tonal information into the 16×16 grid that nearest rounding loses.
     """
     img = Image.fromarray(((1.0 - dark) * 255).astype(np.uint8), "L")
     small = img.resize((size, size), Image.LANCZOS)
     arr = np.asarray(small, dtype=np.float64) / 255.0
-    cells = np.clip(np.round(arr * (levels - 1)).astype(np.uint8), 0, levels - 1)
+    H, W = arr.shape
+
+    if mode == "floyd-steinberg":
+        buf = arr.copy()
+        cells = np.zeros((H, W), dtype=np.uint8)
+        for y in range(H):
+            for x in range(W):
+                old = buf[y, x]
+                lvl = int(np.clip(round(old * (levels - 1)), 0, levels - 1))
+                new = lvl / max(levels - 1, 1)
+                cells[y, x] = lvl
+                err = old - new
+                if x + 1 < W:    buf[y, x + 1]     += err * 7 / 16
+                if y + 1 < H:
+                    if x > 0:    buf[y + 1, x - 1] += err * 3 / 16
+                    buf[y + 1, x]                  += err * 5 / 16
+                    if x + 1 < W: buf[y + 1, x + 1] += err * 1 / 16
+        return cells
+    if mode.startswith("ordered"):
+        bayer = np.array([[ 0,  8,  2, 10],
+                          [12,  4, 14,  6],
+                          [ 3, 11,  1,  9],
+                          [15,  7, 13,  5]], dtype=np.float64) / 16.0 - 0.5
+        m = bayer[np.arange(H)[:, None] % 4, np.arange(W)[None, :] % 4]
+        biased = arr + m / max(levels - 1, 1)
+        return np.clip(np.round(biased * (levels - 1)).astype(int),
+                       0, levels - 1).astype(np.uint8)
+    return np.clip(np.round(arr * (levels - 1)).astype(int),
+                   0, levels - 1).astype(np.uint8)
+
+
+def _render_bbc(cells, size, levels, dots, radius_lut):
+    """Faithful preview of the on-device algorithm with an explicit radius LUT.
+
+    Takes pre-quantised cells (luminance encoding, 0=dark .. L-1=light) so the
+    same dithered grid drives both the cells preview and this render.
+    """
     darkness_grid = (levels - 1) - cells       # 0=light, levels-1=dark
 
     xs, ys = st.r2_sequence(dots)
@@ -170,7 +211,7 @@ def _render_bbc(dark, size, levels, dots, radius_lut):
 
 def render(picker, upload, fit, gamma, brightness, contrast, posterize,
            black_point, white_point, size, levels, dots,
-           radius_preset, radius_text):
+           radius_preset, radius_text, dither):
     img = _resolve_image(picker, upload)
     if img is None:
         blank = np.full((256, 256), 255, dtype=np.uint8)
@@ -183,7 +224,7 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
     levels = int(levels)
     dots = int(dots)
 
-    cells, bright = st.downsample_posterize(dark, size, levels)
+    cells = _downsample_dither(dark, size, levels, dither)
     bits_per = max(1, int(np.ceil(np.log2(levels))))
 
     cells_dev = np.flipud((levels - 1) - cells)
@@ -193,7 +234,7 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
     cells_img = _cells_preview(cell_lum)
 
     lut = _parse_lut(radius_text, levels)
-    ink, radii, plotted = _render_bbc(dark, size, levels, dots, lut)
+    ink, radii, plotted = _render_bbc(cells, size, levels, dots, lut)
     stipple_img = np.where(ink, 0, 255).astype(np.uint8)
 
     raw_bytes = len(src_bytes)
@@ -207,7 +248,8 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
 
     lut_str = ",".join(str(v) for v in lut)
     info = (
-        f"**Source**: {size}×{size} @ {bits_per}bpp = {raw_bytes} B raw  \n"
+        f"**Source**: {size}×{size} @ {bits_per}bpp = {raw_bytes} B raw "
+        f"({dither} dither)  \n"
         f"**Radius LUT**: cell→radius = [{lut_str}]  \n"
         f"**Dots**: {dots} attempted, {plotted} plotted (r>0)  \n"
         f"**Radius histogram**: {hist}  \n"
@@ -219,7 +261,7 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
 
 def reset_defaults():
     return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 768,
-            "cell×2 (current BBC: 0,2,4,6)", "0,2,4,6")
+            "cell×2 (current BBC: 0,2,4,6)", "0,2,4,6", "none")
 
 
 def apply_preset(name, current_text, levels):
@@ -274,6 +316,11 @@ def build_ui():
                     label="LUT (cell 0 → cell L-1, comma-separated)",
                     info="Length should match levels. r=0 skips the dot.",
                 )
+                gr.Markdown("### Dither (into the 4-level quantisation)")
+                dither = gr.Radio(
+                    DITHER_MODES, value="none", label="dither mode",
+                    info="F-S diffuses quantisation error; ordered adds a Bayer threshold pattern.",
+                )
                 reset_btn = gr.Button("Reset defaults")
             with gr.Column(scale=2):
                 with gr.Row():
@@ -287,7 +334,7 @@ def build_ui():
 
         controls = [picker, upload, fit, gamma, brightness, contrast, posterize,
                     black_point, white_point, size, levels, dots,
-                    radius_preset, radius_text]
+                    radius_preset, radius_text, dither]
         outputs = [lum_out, cells_out, stipple_out, info]
 
         for c in controls:
@@ -301,7 +348,7 @@ def build_ui():
         reset_btn.click(
             reset_defaults, [],
             [fit, gamma, brightness, contrast, posterize, black_point, white_point,
-             size, levels, dots, radius_preset, radius_text],
+             size, levels, dots, radius_preset, radius_text, dither],
         ).then(render, controls, outputs)
 
         demo.load(render, controls, outputs)
