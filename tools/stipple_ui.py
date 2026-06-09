@@ -53,6 +53,29 @@ def r2_sequence_asm(n):
     return (xs >> 8).astype(np.uint8), (ys >> 8).astype(np.uint8)
 
 
+def r2_sequence_asm_full(n):
+    """Same R2 but return the full 16-bit accumulators as float [0, 256).
+
+    The on-device R2 throws away the low byte and uses only the high byte for
+    the pixel coordinate. But the low byte still carries information about
+    the dot's *sub-pixel* position — and since the offline packer builds the
+    radius script ahead of time, we can use that sub-pixel position to BILINEAR
+    sample the darkness map at much finer effective resolution than the 256×256
+    integer grid. The device replays the same i-th radius byte at the same
+    integer position, so this costs nothing on the BBC.
+    """
+    xacc = 0
+    yacc = 0
+    xs = np.empty(n, dtype=np.float64)
+    ys = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        xacc = (xacc + XINC_ASM) & 0xFFFF
+        yacc = (yacc + YINC_ASM) & 0xFFFF
+        xs[i] = xacc / 256.0     # 0 .. 256, fractional part = sub-pixel
+        ys[i] = yacc / 256.0
+    return xs, ys
+
+
 def _list_pics():
     if not PICS_DIR.exists():
         return []
@@ -260,17 +283,18 @@ def _render_bbc(cells, size, levels, dots, radius_lut):
     return ink, radii, plotted
 
 
-def _build_dot_script(dark, levels, n_dots, dither):
+def _build_dot_script(dark, levels, n_dots, dither, sampling):
     """Option 2: 64 B of source = a sequence of per-iteration darkness levels.
 
     For each R2 iteration i ∈ [0, n_dots), sample the source darkness at the
     R2 position (no 16×16 cell grid involved), quantise to `levels`, pack at
     `bits_per` bits per dot. On device the byte stream is replayed in lockstep
-    with R2: the i-th stored level supplies the radius for the i-th dot. This
-    trades the grid resolution (16×16 = 256 cells, one cell drives MANY dots)
-    for sample resolution (256 dots, ONE value per dot) at the same data rate.
+    with R2: the i-th stored level supplies the radius for the i-th dot.
 
-    Returns (xs, ys, darkness_per_dot, packed_bytes).
+    `sampling` ∈ {"nearest", "bilinear"} picks the offline sampling method:
+    bilinear uses the R2 sub-pixel position (the low byte of the 16-bit R2
+    accumulators) to weighted-average the 4 surrounding pixels — costs zero
+    on-device, since the device still plots at the integer high-byte position.
     """
     H, W = dark.shape
     if dither.startswith("ordered"):
@@ -286,10 +310,32 @@ def _build_dot_script(dark, levels, n_dots, dither):
         # different from 'none' here. Skip it in script mode.
         sample_field = dark
 
-    xs, ys = r2_sequence_asm(n_dots)
-    # Mirror y to match BBC y-up convention (see _render_bbc).
-    ys = (255 - ys.astype(np.int32)).astype(np.uint8)
-    samples = sample_field[ys.astype(np.int32), xs.astype(np.int32)]
+    if sampling == "bilinear":
+        # Use the full 16-bit R2 accumulators (sub-pixel positions). Sample
+        # the darkness map with bilinear interpolation, then take the integer
+        # high byte as the actual plotting position the BBC uses.
+        xf_full, yf_full = r2_sequence_asm_full(n_dots)
+        # Mirror y for the BBC y-up convention (same as _render_bbc).
+        yf_full = 256.0 - yf_full
+        x0 = np.floor(xf_full).astype(np.int32) % W
+        y0 = np.floor(yf_full).astype(np.int32) % H
+        x1 = (x0 + 1) % W
+        y1 = (y0 + 1) % H
+        fx = xf_full - np.floor(xf_full)
+        fy = yf_full - np.floor(yf_full)
+        s00 = sample_field[y0, x0]
+        s01 = sample_field[y0, x1]
+        s10 = sample_field[y1, x0]
+        s11 = sample_field[y1, x1]
+        samples = ((1 - fx) * (1 - fy) * s00 + fx * (1 - fy) * s01
+                   + (1 - fx) * fy * s10 + fx * fy * s11)
+        xs = (x0.astype(np.int32) & 0xFF).astype(np.uint8)
+        ys = (y0.astype(np.int32) & 0xFF).astype(np.uint8)
+    else:
+        xs, ys = r2_sequence_asm(n_dots)
+        # Mirror y to match BBC y-up convention (see _render_bbc).
+        ys = (255 - ys.astype(np.int32)).astype(np.uint8)
+        samples = sample_field[ys.astype(np.int32), xs.astype(np.int32)]
     # quantise darkness 0..1 to integer level 0..L-1 (0=light, L-1=dark)
     dlevels = np.clip(np.round(samples * (levels - 1)).astype(np.int32),
                       0, levels - 1)
@@ -298,9 +344,10 @@ def _build_dot_script(dark, levels, n_dots, dither):
     return xs, ys, dlevels, packed
 
 
-def _render_dot_script(dark, levels, n_dots, radius_lut, dither):
+def _render_dot_script(dark, levels, n_dots, radius_lut, dither, sampling):
     """Render mode 2: R2 placement + per-iteration radius LUT lookup."""
-    xs, ys, dlevels, packed = _build_dot_script(dark, levels, n_dots, dither)
+    xs, ys, dlevels, packed = _build_dot_script(
+        dark, levels, n_dots, dither, sampling)
     lut = np.asarray(radius_lut, dtype=np.int32)
     radii = lut[np.clip(dlevels, 0, len(lut) - 1)]
     ink, plotted = _stamp_dots(xs, ys, radii)
@@ -332,7 +379,7 @@ DATA_MODES = [
 
 def render(picker, upload, fit, gamma, brightness, contrast, posterize,
            black_point, white_point, size, levels, dots,
-           radius_preset, radius_text, dither, data_mode):
+           radius_preset, radius_text, dither, data_mode, script_sampling):
     img = _resolve_image(picker, upload)
     if img is None:
         blank = np.full((256, 256), 255, dtype=np.uint8)
@@ -350,10 +397,13 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
     data_budget = 64  # bytes the data section currently has room for
 
     if data_mode.startswith("dot script"):
-        # script mode: data is per-iteration radii, n_dots = budget × 8 / bits_per
-        n_dots = (data_budget * 8) // bits_per
+        # script mode: data is per-iteration radii. size×size = total dot
+        # count, byte count = (size² × bits_per) / 8. Same semantics for size
+        # as cell-lookup mode (data points per axis), just laid out as a
+        # sequence instead of a grid.
+        n_dots = size * size
         ink, radii, plotted, packed = _render_dot_script(
-            dark, levels, n_dots, lut, dither)
+            dark, levels, n_dots, lut, dither, script_sampling)
         stipple_img = np.where(ink, 0, 255).astype(np.uint8)
         raw_bytes = len(packed)
 
@@ -363,8 +413,9 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
         ys_p = (255 - ys_p.astype(np.int32)).astype(np.uint8)
         cells_img = _script_radii_image(xs_p, ys_p, radii, int(max(lut) if lut else 0))
         mode_descr = (
-            f"**Mode**: dot script — {n_dots} dots × {bits_per}b = {raw_bytes} B "
-            f"({dither} dither {'(applied)' if dither.startswith('ordered') else '(ignored — F-S irrelevant for point samples)'})"
+            f"**Mode**: dot script ({script_sampling} sampling) — "
+            f"{size}×{size} = {n_dots} dots × {bits_per}b = {raw_bytes} B "
+            f"({dither} dither {'(applied)' if dither.startswith('ordered') else '(F-S ignored — irrelevant for point samples)'})"
         )
     else:
         # cell-lookup mode (the current asm)
@@ -403,7 +454,7 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
 def reset_defaults():
     return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 768,
             "cell×2 (current BBC: 0,2,4,6)", "0,2,4,6", "none",
-            "cell lookup (16×16 grid)")
+            "cell lookup (16×16 grid)", "bilinear")
 
 
 def apply_preset(name, current_text, levels):
@@ -444,7 +495,13 @@ def build_ui():
                 black_point = gr.Slider(0.0, 1.0, value=0.0, step=0.01, label="black point")
                 white_point = gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="white point")
                 gr.Markdown("### Device parameters")
-                size = gr.Slider(8, 32, value=16, step=4, label="grid size (NxN). 16 is the size-coded target.")
+                size = gr.Slider(
+                    8, 64, value=16, step=2,
+                    label="grid / dot count (N×N)",
+                    info=("cell-lookup mode: cell grid resolution (16 = current asm; >32 won't fit). "
+                          "dot-script mode: total dot count is N×N (16×16=256 dots = 64 B at 2 bpp; "
+                          "32×32=1024 dots = 256 B — exceeds budget but reveals visual ceiling)."),
+                )
                 levels = gr.Slider(2, 8, value=4, step=1, label="levels (4 = 2 bpp)")
                 dots = gr.Slider(64, 2048, value=768, step=32, label="R2 dot iterations")
                 gr.Markdown("### Radius mapping (cell darkness → pixel radius)")
@@ -472,6 +529,16 @@ def build_ui():
                           "(256 dots × 2 bits = 64 B at L=4). One sample per dot — "
                           "more detail at edges, fewer dots total."),
                 )
+                script_sampling = gr.Radio(
+                    ["nearest", "bilinear"], value="bilinear",
+                    label="dot-script sampling (Option 2 only)",
+                    info=("'nearest' = sample dark map at the dot's integer pixel "
+                          "position only. 'bilinear' = use the R2 sub-pixel position "
+                          "(the low byte of the 16-bit R2 accumulators that the asm "
+                          "currently throws away) to blend the 4 surrounding pixels. "
+                          "Free on-device — the BBC still plots at the same integer "
+                          "position; bilinear only changes the offline-baked radius."),
+                )
                 reset_btn = gr.Button("Reset defaults")
             with gr.Column(scale=2):
                 with gr.Row():
@@ -485,7 +552,7 @@ def build_ui():
 
         controls = [picker, upload, fit, gamma, brightness, contrast, posterize,
                     black_point, white_point, size, levels, dots,
-                    radius_preset, radius_text, dither, data_mode]
+                    radius_preset, radius_text, dither, data_mode, script_sampling]
         outputs = [lum_out, cells_out, stipple_out, info]
 
         for c in controls:
@@ -499,7 +566,8 @@ def build_ui():
         reset_btn.click(
             reset_defaults, [],
             [fit, gamma, brightness, contrast, posterize, black_point, white_point,
-             size, levels, dots, radius_preset, radius_text, dither, data_mode],
+             size, levels, dots, radius_preset, radius_text, dither, data_mode,
+             script_sampling],
         ).then(render, controls, outputs)
 
         demo.load(render, controls, outputs)
