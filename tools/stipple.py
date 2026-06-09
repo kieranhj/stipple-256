@@ -374,6 +374,246 @@ def bbc_export(points, radii, W, H, levels, outdir, stem, zx02_bin, log=True):
 
 
 # --------------------------------------------------------------------------
+# mode256 — 256-byte BBC Master intro preview
+# --------------------------------------------------------------------------
+#
+# Emulates the on-device algorithm from docs/STIPPLE-256.md:
+#   - R2 low-discrepancy additive sequence in two 16-bit accumulators;
+#     the high byte of each is the dot coord (0..255), matching the cheapest
+#     6502 implementation.
+#   - Brightness at (x,y) comes from either:
+#       (a) a procedural formula evaluated on the device (zero source bytes), or
+#       (b) a tiny downsampled+posterized stored image (option 2 in the plan).
+#   - radius = (255 - brightness) >> 5  ->  0..7; r==0 dots are skipped.
+#   - Each kept dot is a filled disc of that integer radius.
+# Output canvas is 256x256 pixels; the device scales these to MODE 4 graphics
+# units by *4. We work in 256x256 here so the preview math matches the bytes
+# we'd actually execute.
+
+R2_PHI2 = 1.32471795724474602596
+
+
+def r2_sequence(n):
+    """R2 additive low-discrepancy sequence. Returns two uint8 arrays (xs, ys).
+
+    Mirrors the on-device math: 16-bit accumulators + two 16-bit increments;
+    the dot coord is the accumulator's high byte.
+    """
+    XINC = round((1.0 / R2_PHI2) * 65536) & 0xFFFF             # ~0.7548 * 65536
+    YINC = round((1.0 / (R2_PHI2 * R2_PHI2)) * 65536) & 0xFFFF  # ~0.5698 * 65536
+    xacc = 0
+    yacc = 0
+    xs = np.empty(n, dtype=np.uint16)
+    ys = np.empty(n, dtype=np.uint16)
+    for i in range(n):
+        xacc = (xacc + XINC) & 0xFFFF
+        yacc = (yacc + YINC) & 0xFFFF
+        xs[i] = xacc
+        ys[i] = yacc
+    return (xs >> 8).astype(np.uint8), (ys >> 8).astype(np.uint8)
+
+
+def proc_brightness_map(name):
+    """Build a 256x256 uint8 brightness map for a named procedural source."""
+    yy, xx = np.mgrid[0:256, 0:256].astype(np.float64)
+    fx = (xx - 128.0) / 128.0
+    fy = (yy - 128.0) / 128.0
+    if name == "sphere":
+        d2 = fx * fx + fy * fy
+        z = np.sqrt(np.clip(1.0 - d2, 0.0, 1.0))
+        # light from upper-left, slight tilt
+        lx, ly, lz = -0.5, -0.5, 0.707
+        ln = (lx * lx + ly * ly + lz * lz) ** 0.5
+        nl = np.clip((fx * lx + fy * ly + z * lz) / ln, 0.0, 1.0) ** 1.5
+        # sphere reads dark on white; highlight reaches near-white, terminator
+        # goes near-black, so radius maps across the full 0..7 range.
+        b = np.where(d2 <= 1.0, 10.0 + 240.0 * nl, 255.0)
+    elif name == "plasma":
+        v = np.sin(fx * 3.1) + np.cos(fy * 2.7) + np.sin((fx + fy) * 2.3)
+        b = 128.0 + 50.0 * v
+    elif name == "torus":
+        # off-axis torus distance proxy (cheap, not a real SDF)
+        r1 = np.sqrt(fx * fx + fy * fy * 0.6) - 0.55
+        d = np.sqrt(r1 * r1 + fy * fy * 0.4)
+        b = np.clip(255.0 - 700.0 * np.maximum(0.0, 0.18 - d), 0.0, 255.0)
+    else:
+        raise ValueError(f"unknown --procedural {name!r} (try: sphere, plasma, torus)")
+    return np.clip(b, 0.0, 255.0).astype(np.uint8)
+
+
+def downsample_posterize(dark, size, levels):
+    """Resize the darkness map to size x size and posterize to `levels`.
+
+    Returns the cell grid (uint8, 0..levels-1) AND the 256x256 nearest-cell
+    brightness map the device would see at runtime.
+    """
+    img = Image.fromarray(((1.0 - dark) * 255).astype(np.uint8), "L")
+    small = img.resize((size, size), Image.LANCZOS)
+    arr = np.asarray(small, dtype=np.float64) / 255.0           # luminance
+    cells = np.clip(np.round(arr * (levels - 1)).astype(np.uint8), 0, levels - 1)
+
+    # nearest-cell lookup as the device would do: ix = (x * size) >> 8
+    yy, xx = np.mgrid[0:256, 0:256]
+    ix = (xx * size) // 256
+    iy = (yy * size) // 256
+    cell_lum = (cells.astype(np.float64) / max(levels - 1, 1) * 255.0).astype(np.uint8)
+    bright = cell_lum[iy, ix]
+    return cells, bright
+
+
+def pack_bits(values, bits_per):
+    """Pack small ints LSB-first into a byte stream.
+
+    Cell 0 lands in the low bits of byte 0, cell 1 above it, etc. This is the
+    cheapest layout for the 6502 lookup: shift count = (cell_idx & 3) * bits_per
+    with no EOR/complement needed.
+    """
+    out = bytearray()
+    acc = 0
+    nbits = 0
+    mask = (1 << bits_per) - 1
+    for v in values:
+        acc |= (int(v) & mask) << nbits
+        nbits += bits_per
+        while nbits >= 8:
+            out.append(acc & 0xFF)
+            acc >>= 8
+            nbits -= 8
+    if nbits:
+        out.append(acc & 0xFF)
+    return bytes(out)
+
+
+def try_zx02(data, outdir, stem, zx02_bin):
+    """Compress with zx02 if available; returns size or None."""
+    if not data:
+        return None
+    import shutil
+    import subprocess
+    zx02 = shutil.which(zx02_bin) or (zx02_bin if Path(zx02_bin).exists() else None)
+    if not zx02:
+        return None
+    raw = outdir / f"{stem}_mode256_src.bin"
+    raw.write_bytes(data)
+    zpath = outdir / f"{stem}_mode256_src.zx02"
+    try:
+        subprocess.run([zx02, "-f", str(raw), str(zpath)],
+                       check=True, capture_output=True)
+        return zpath.stat().st_size
+    except subprocess.CalledProcessError:
+        return None
+
+
+def mode256_render(brightmap, dots, levels=8):
+    """R2-place `dots` points over the 256x256 brightmap and stamp discs."""
+    W = H = 256
+    xs, ys = r2_sequence(dots)
+    b = brightmap[ys, xs]
+    darkness = (255 - b.astype(np.int32))
+    radii = (darkness >> 5).astype(np.int32)        # 0..7
+
+    ink = np.zeros((H, W), dtype=bool)
+    masks = {r: disc_mask(r) for r in range(levels)}
+    plotted = 0
+    for x, y, r in zip(xs, ys, radii):
+        if r <= 0:
+            continue
+        plotted += 1
+        m = masks[r]
+        x0, y0 = int(x) - r, int(y) - r
+        sx0 = max(0, -x0); sy0 = max(0, -y0)
+        dx0 = max(0, x0);  dy0 = max(0, y0)
+        ex = min(W, x0 + m.shape[1]); ey = min(H, y0 + m.shape[0])
+        if ex <= dx0 or ey <= dy0:
+            continue
+        sub = m[sy0:sy0 + (ey - dy0), sx0:sx0 + (ex - dx0)]
+        ink[dy0:ey, dx0:ex] |= sub
+    return ink, radii, plotted
+
+
+def save_mode256_previews(brightmap, ink, outdir, stem):
+    H, W = ink.shape
+    stip = np.where(ink, 0, 255).astype(np.uint8)
+    Image.fromarray(stip, "L").save(outdir / f"{stem}_mode256.png")
+    Image.fromarray(stip, "L").resize((W * 3, H * 3), Image.NEAREST).save(
+        outdir / f"{stem}_mode256_3x.png")
+    pad = 8
+    comp = np.full((H, W * 2 + pad), 255, np.uint8)
+    comp[:, :W] = brightmap
+    comp[:, W + pad:] = stip
+    Image.fromarray(comp, "L").resize(
+        ((W * 2 + pad) * 2, H * 2), Image.NEAREST).save(
+        outdir / f"{stem}_mode256_compare.png")
+
+
+def mode256_preview(args, dark, outdir, stem):
+    """Build the 256-byte-target preview and print the byte-budget estimate."""
+    if args.procedural:
+        bright = proc_brightness_map(args.procedural)
+        src_bytes = b""
+        src_descr = f"procedural '{args.procedural}' (no source data)"
+        zsize = None
+    else:
+        size = args.mode256_size
+        L = args.mode256_levels
+        cells, bright = downsample_posterize(dark, size, L)
+        bits_per = max(1, int(np.ceil(np.log2(L))))
+        # cells from downsample_posterize encode LUMINANCE (0=dark, L-1=light)
+        # but the BBC reads `r = cell * 2`, so cell 0 must mean "no dot" and
+        # cell L-1 must mean "biggest dot". Invert to darkness ordering.
+        # Also flip vertically: BBC graphics y=0 is at the BOTTOM of the screen.
+        cells_dev = np.flipud((L - 1) - cells)
+        src_bytes = pack_bits(cells_dev.ravel(), bits_per)
+        src_descr = f"{size}x{size} @ {bits_per}bpp = {size*size*bits_per/8:.0f} B raw"
+        zsize = try_zx02(src_bytes, outdir, stem, args.zx02)
+        # always write the raw stored image too for inspection
+        (outdir / f"{stem}_mode256_src.bin").write_bytes(src_bytes)
+
+    ink, radii, plotted = mode256_render(bright, args.mode256_dots)
+    save_mode256_previews(bright, ink, outdir, stem)
+
+    # rough on-device code budget per docs/STIPPLE-256.md
+    parts = {
+        "VDU init (table+OSWRCH)":   16,
+        "R2 placement":              14,
+        "brightness eval":           (35 if args.procedural else 20),
+        "radius map":                 6,
+        "emit MOVE+filled circle":   40,
+        "loop control":              10,
+    }
+    code_est = sum(parts.values())
+    data_cost = zsize if zsize is not None else len(src_bytes)
+    total = code_est + data_cost
+
+    print("\n=== mode256 preview ===")
+    print(f"source                   : {src_descr}")
+    if src_bytes:
+        print(f"source bytes (raw)       : {len(src_bytes)}")
+        if zsize is not None:
+            print(f"source bytes (zx02)      : {zsize}  "
+                  f"({100*zsize/max(len(src_bytes),1):.0f}% of raw)  <-- ships on disc")
+        else:
+            print(f"source bytes (zx02)      : -- (zx02 not found)")
+    print(f"dots attempted           : {args.mode256_dots}")
+    print(f"dots plotted (r>0)       : {plotted}")
+    rh = np.bincount(np.clip(radii, 0, 7), minlength=8)
+    print("\nradius histogram (level: count)")
+    for r in range(8):
+        bar = "#" * int(40 * rh[r] / max(rh.max(), 1))
+        tag = " (skipped)" if r == 0 else ""
+        print(f"  r={r}: {rh[r]:5d} {bar}{tag}")
+    print("\n=== byte budget estimate (256 B target) ===")
+    for k, v in parts.items():
+        print(f"  {k:30s} ~{v:3d} B")
+    print(f"  {'code subtotal':30s} ~{code_est:3d} B")
+    print(f"  {'data':30s}  {data_cost:3d} B")
+    print(f"  {'TOTAL':30s} ~{total:3d} B   "
+          f"{'OK' if total <= 256 else 'OVER ('+str(total-256)+' B)'}")
+    print(f"\noutputs in {outdir}/  ({stem}_mode256.png, _mode256_3x.png, "
+          f"_mode256_compare.png{', _mode256_src.bin' if src_bytes else ''})")
+
+
+# --------------------------------------------------------------------------
 # data export + compression report
 # --------------------------------------------------------------------------
 
@@ -461,6 +701,19 @@ def main():
     ap.add_argument("--bbc", action="store_true",
                     help="also export BBC Micro delta-stream data and zx02-compress it")
     ap.add_argument("--zx02", default="zx02", help="path to the zx02 compressor binary")
+    # --- 256-byte BBC Master preview (docs/STIPPLE-256.md) ---
+    ap.add_argument("--mode256", action="store_true",
+                    help="render the 256-byte intro preview (R2 placement, tiny "
+                         "stored or procedural source) and skip the Lloyd pipeline")
+    ap.add_argument("--procedural", default=None, metavar="NAME",
+                    help="mode256: use a procedural brightness source instead of "
+                         "the image (sphere|plasma|torus)")
+    ap.add_argument("--mode256-size", type=int, default=24,
+                    help="mode256: stored source resolution (NxN, default 24)")
+    ap.add_argument("--mode256-levels", type=int, default=4,
+                    help="mode256: posterize levels for stored source (default 4 = 2bpp)")
+    ap.add_argument("--mode256-dots", type=int, default=1200,
+                    help="mode256: number of R2-placed dot attempts (r==0 are skipped)")
     ap.add_argument("--make-test-image", metavar="PATH", default=None,
                     help="write a synthetic test image to PATH and use it")
     ap.add_argument("-q", "--quiet", action="store_true")
@@ -473,11 +726,21 @@ def main():
     if args.make_test_image:
         make_test_image(args.make_test_image, W, H)
         args.image = args.make_test_image
-    if not args.image:
-        ap.error("provide an image, or use --make-test-image PATH")
+    if not args.image and not args.procedural:
+        ap.error("provide an image, or use --make-test-image PATH, "
+                 "or --mode256 --procedural NAME")
 
-    stem = args.stem or Path(args.image).stem
+    stem = args.stem or (Path(args.image).stem if args.image else f"proc_{args.procedural}")
     rng = np.random.default_rng(args.seed)
+
+    if args.mode256:
+        # mode256 uses 256x256 px space (matches the on-device hi-byte math)
+        if args.procedural:
+            dark = None
+        else:
+            dark = load_darkness(args.image, 256, 256, args, args.fit)
+        mode256_preview(args, dark, outdir, stem)
+        return
 
     dark = load_darkness(args.image, W, H, args, args.fit)
 

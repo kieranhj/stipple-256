@@ -153,8 +153,123 @@ ink still roughly tracks tone because more+bigger dots land in dark regions.
 
 ## Status / caveats
 
-- Nothing for the 256 B target is built yet — this is the plan only.
-- PLOT code numbers and graphics-unit scaling are from memory; verify on the
-  Master/emulator before relying on them.
-- The 4 KB MODE 4 player in `bbc/` is unaffected and still the "full quality"
-  path.
+- The 4 KB MODE 4 player in `bbc/stipple.asm` is unaffected and still the
+  "full quality" path.
+
+---
+
+## What got built
+
+A working **256-byte** Master intro: [`bbc/stipple256.asm`](../bbc/stipple256.asm)
+plus the data file [`bbc/data/mona16.bin`](../bbc/data/mona16.bin) (16×16 @
+2bpp = 64 B). Boots from `bbc/stipple256.ssd`. Verified end-to-end on jsbeeb
+Master.
+
+### Final layout (255 bytes of 256)
+
+| section | bytes | what |
+|---|---|---|
+| code | 183 | R2 advance, image lookup, gx/gy compute, MOVE+PLOT emit, loop ctrl |
+| VDU init table | 9 | MODE 4 + palette setup + cursor-hide |
+| image data | 64 | 16×16 @ 2bpp, LSB-first, darkness-encoded, vertically flipped |
+| **total** | **255 / 256** | 1 byte spare |
+
+### Algorithm (matching the on-device implementation)
+
+1. **VDU init** (sent in reverse from a 9-byte table via `dex/bpl`, -2 B vs
+   forward):
+   - `22, 4`  — MODE 4 (320×256, 1bpp).
+   - `17, 129` — text bg = logical 1 (white in default palette).
+   - `12` — CLS (clears to bg = white).
+   - `5` — VDU 5: text-at-graphics-cursor; suppresses the flashing text
+     cursor (it must come *after* CLS — in VDU 5 mode CLS doesn't clear
+     the way we want).
+   - `18, 0, 0` — GCOL 0,0: plot in logical 0 (black).
+
+2. **Placement** — R2 plastic-φ additive sequence in two 16-bit zero-page
+   accumulators (`XINC = $C142`, `YINC = $91DF`). Read the high byte of each
+   accumulator as `(px, py)` in 0..255. Cheap, no tables.
+
+3. **Cell lookup** — `cell_idx = (py & $F0) | (px >> 4)`; byte_offset =
+   `cell_idx >> 2`; shift_count = `(cell_idx & 3) * 2`. Load source byte,
+   shift right by shift_count, `AND #3` to extract the 2-bit cell. Source
+   bytes are **LSB-first packed** so this needs no EOR/complement.
+
+4. **Radius** — `r = cell * 2` → `{0, 2, 4, 6}` pixel radii. `r == 0`
+   skips the dot. Graphics-unit radius is `r * 4`.
+
+5. **Emit** — build a 6-byte buffer `[25, k, xL, xH, yL, yH]` in zero page,
+   `JSR emit6` (a small loop that walks the buffer through OSWRCH). Twice
+   per dot: `k=4` (MOVE absolute) at `(px*4, py*4)`, then `k=157` (filled
+   circle absolute) at `(px*4 + r*4, py*4)`. The MOS computes the circle
+   radius as the distance from the last MOVE to this perimeter point.
+
+6. **Halt** — 16-bit zero-page counter (`$0300 = 768` initial). Each
+   iteration: if `cnt_lo == 0`, decrement `cnt_hi` and check `BMI hang`;
+   otherwise decrement `cnt_lo`. (Using X as the counter doesn't work
+   because the image lookup `tax`'s the byte_offset into X.)
+
+### Subtleties that took byte-shuffling to get right
+
+- **PLOT codes are sub-classed by k mod 8.** `153` (= 152+1) is *relative*
+  filled circle — passing absolute coords to it makes the MOS add the
+  graphics cursor twice, producing screen-filling discs. The correct
+  absolute-foreground code is **`157`** (= 152+5). See the bug-hunt
+  history in commit `8d2e74f`... err, the current commit.
+- **Source orientation.** BBC graphics y=0 is at the *bottom* of the
+  screen, image y=0 is at the *top*. The Python packer applies
+  `np.flipud` so cell row 0 of the stored bytes corresponds to the
+  bottom of the source picture.
+- **Cell semantics.** Cells encode *darkness* (0=light → r=0 skip;
+  L-1=dark → biggest dot), not luminance. The earlier luminance encoding
+  drew the image as a photographic negative.
+- **MODE 4 pixel aspect.** Pixels are roughly 1:2 (wide:tall) on a CRT,
+  so a "circular" PLOT 157 displays as a tall oval. Each dot covers ~2×
+  the area Python's preview disc predicts, which is why we settled on
+  768 iterations with r ∈ {2,4,6} instead of the naive 1024+.
+- **R2 banding.** At this density and aspect, the R2 step lands many
+  consecutive dots at nearly the same y, producing visible horizontal
+  bands of merged ovals. Stylistic feature at this scale — looks like
+  scan-line halftone.
+
+### Workflow
+
+```
+# preview / choose a source (16x16 @ 2bpp)
+python tools/stipple.py --mode256 pics/<image>.png --stem <stem> \
+    --mode256-size 16 --mode256-levels 4 --mode256-dots 768 \
+    -o stipple_out -q
+
+# copy the chosen source into the data dir
+cp stipple_out/<stem>_mode256_src.bin bbc/data/mona16.bin
+
+# assemble + run on jsbeeb (or beebem etc.)
+cd bbc && ../tools/beebasm.exe -i stipple256.asm -do stipple256.ssd -boot STIP256 -v
+```
+
+The Python preview is faithful enough to the on-device behaviour to pick a
+subject and tone-tune (`--gamma`, `--contrast`, `--black-point`) without
+rebooting the emulator each iteration.
+
+### Subjects tested (768 dots @ 16×16 @ 2bpp)
+
+| subject | reads as |
+|---|---|
+| **monarch** | butterfly — wings out, light body in centre. Clearest subject. |
+| **mandarin-duck-1** | duck silhouette in left half, water/sky on right. |
+| **mona_lisa_crop** | abstract portrait — diagonal body + lighter face. Default. |
+| baboon | face features, two darker eye regions. |
+| lena | survives badly at 16×16 — almost pure noise. |
+
+### Ideas not pursued
+
+- **PRNG-driven radii + brute-forced seed.** 768 dots × 3 bits of radius =
+  ~2300 bits of entropy. No 16/24/32-bit seed encodes a recognisable
+  image; you only get pleasing accidents. Useful for *abstract* intros.
+- **px×5 instead of px×4** to remove the ~25% right-edge letterbox. Costs
+  ~6 B; we don't have it.
+- **4-byte radius LUT** for non-linear cell→radius mapping (e.g. r ∈
+  {0,1,3,5}). Costs ~7 B; doesn't fit.
+- **LFSR placement** instead of R2. Marginally smaller code, no
+  horizontal banding, but cycles through 65535 distinct positions in
+  pseudo-random order — visually noisier than R2.
