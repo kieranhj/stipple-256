@@ -261,6 +261,50 @@ rebooting the emulator each iteration.
 | baboon | face features, two darker eye regions. |
 | lena | survives badly at 16×16 — almost pure noise. |
 
+### Where to go from here
+
+The current build is data-starved: 16×16 × 2 bpp = 64 cells × 4 darkness levels is
+near the floor of what a recognisable photographic subject can survive. Going
+denser (24×24 = 144 B at 2 bpp) doesn't fit alongside the existing ~191 B of
+code, and the cell-index trick `(py & $F0) | (px >> 4)` only works because the
+grid is exactly 16 wide — a 24-wide grid needs a `row * 24` multiply (~10 extra
+bytes) on top of the data overflow. So we either *make 16×16×4 read better* or
+**change the architecture** so the same byte budget conveys more.
+
+**1. Squeeze 16×16×4 harder (no code change).** Subjects with bold silhouettes
+   against a clean field beat portraits at this resolution; tight crops where
+   the subject fills the frame are mandatory. Aggressive S-curve / `--gamma`
+   / `--contrast`, sharpen-before-downsample, and Floyd–Steinberg / blue-noise
+   dither into the 4-level quantization (instead of nearest-level rounding) all
+   help; the resulting 64 B is small enough to *hand-tune* afterwards.
+
+**2. Re-interpret the 64 B as a dot script.** Drop the cell lookup entirely
+   and read the data as `radius_for_iteration[i]` — 256 dots × 2 bits = 64 B.
+   R2 still supplies (x, y); the byte stream supplies the radius. Saves ~12 B
+   of cell-lookup code. The radius of any given dot is locked to its iteration
+   index rather than its screen position, so the *offline* packer has to sort
+   iterations such that the i-th R2 sample lands where the desired darkness
+   wants its i-th biggest dot. More authoring power per byte, at the cost of
+   off-device complexity.
+
+**3. Two-pass multi-frequency.** Same 64 B, but render in two passes with
+   different radius mappings (or different iteration subsets) — pass 1 places
+   only the largest dots for low-frequency structure, pass 2 fills mid-tones.
+   ~6–10 B of code. Better perceived structure at the same data rate.
+
+**4. Brute-forced LFSR seed (no image data).** Throw the 64 B of source out
+   entirely; ship a 2-byte seed + a fixed reconstruction rule, brute-forced
+   offline to maximise SSIM against a target. Frees ~60 B for code/iterations.
+   Realistically won't match a *specific* photo well, but with millions of
+   candidate seeds scored against the target it can produce an "abstract
+   face-like blob" that reads better than random. Pure size-coding flex.
+
+The likely best combination on a single sitting is **(1) + (2)**: get a
+bold-silhouette subject working great on the current engine first to validate
+the preprocessing pipeline, then prototype the per-iteration-radius script —
+same data budget but with full offline control over dot order, which is where
+blue-noise / structured-dither wins really live.
+
 ### Ideas not pursued
 
 - **PRNG-driven radii + brute-forced seed.** 768 dots × 3 bits of radius =
