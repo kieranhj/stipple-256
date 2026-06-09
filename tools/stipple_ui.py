@@ -28,6 +28,31 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PICS_DIR = REPO_ROOT / "pics"
 
 
+# --- R2 sequence matching the asm exactly -------------------------------------
+# The on-device constants in bbc/stipple256.asm are XINC=$C142, YINC=$91DF.
+# stipple.r2_sequence derives its constants from the plastic-phi formula and
+# rounds to $C140 / $91E1 — off by 2 from the asm. Over 768 iterations 712 of
+# the dots land at different positions, hiding the R2 streak structure in the
+# preview. The preview MUST use the same constants the asm actually executes,
+# so we hard-code them here.
+XINC_ASM = 0xC142
+YINC_ASM = 0x91DF
+
+
+def r2_sequence_asm(n):
+    """Mirror the 6502 R2 with the exact asm constants. Returns uint8 xs, ys."""
+    xacc = 0
+    yacc = 0
+    xs = np.empty(n, dtype=np.uint16)
+    ys = np.empty(n, dtype=np.uint16)
+    for i in range(n):
+        xacc = (xacc + XINC_ASM) & 0xFFFF
+        yacc = (yacc + YINC_ASM) & 0xFFFF
+        xs[i] = xacc
+        ys[i] = yacc
+    return (xs >> 8).astype(np.uint8), (ys >> 8).astype(np.uint8)
+
+
 def _list_pics():
     if not PICS_DIR.exists():
         return []
@@ -171,26 +196,29 @@ def _downsample_dither(dark, size, levels, mode):
                    0, levels - 1).astype(np.uint8)
 
 
-def _render_bbc(cells, size, levels, dots, radius_lut):
-    """Faithful preview of the on-device algorithm with an explicit radius LUT.
+def _disc_mask_bbc(r):
+    """Filled disc matching the BBC MOS PLOT 157 rasterisation more closely.
 
-    Takes pre-quantised cells (luminance encoding, 0=dark .. L-1=light) so the
-    same dithered grid drives both the cells preview and this render.
+    stipple.disc_mask uses x²+y² ≤ r², which at small radii produces sharp
+    diamond/plus shapes (the corner pixels (±1,±2) at r=2 are excluded
+    because 5 > 4). The BBC's Bresenham-style span-fill circle is more
+    generous and includes those near-corner pixels — e.g. r=2 comes out as a
+    near-square 5×5, not a 5-pixel diamond. Threshold of r²+r (= r·(r+1))
+    rounds the corners in instead of flattening them: at r=2, (±1,±2) and
+    (±2,±1) pass (5 ≤ 6) but (±2,±2) still fails (8 > 6).
     """
-    darkness_grid = (levels - 1) - cells       # 0=light, levels-1=dark
+    if r <= 0:
+        return np.ones((1, 1), dtype=bool)
+    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+    return (xx * xx + yy * yy) <= r * r + r
 
-    xs, ys = st.r2_sequence(dots)
-    iy = (ys.astype(np.int32) * size) // 256
-    ix = (xs.astype(np.int32) * size) // 256
-    cell_vals = darkness_grid[iy, ix]
 
-    lut = np.asarray(radius_lut, dtype=np.int32)
-    radii = lut[np.clip(cell_vals, 0, len(lut) - 1)]
-
+def _stamp_dots(xs, ys, radii):
+    """Stamp filled circular discs onto a 256×256 ink map."""
     W = H = 256
     max_r = int(radii.max()) if len(radii) else 0
     ink = np.zeros((H, W), dtype=bool)
-    masks = {r: st.disc_mask(r) for r in range(max_r + 1)}
+    masks = {r: _disc_mask_bbc(r) for r in range(max_r + 1)}
     plotted = 0
     for x, y, r in zip(xs, ys, radii):
         r = int(r)
@@ -206,12 +234,105 @@ def _render_bbc(cells, size, levels, dots, radius_lut):
             continue
         sub = m[sy0:sy0 + (ey - dy0), sx0:sx0 + (ex - dx0)]
         ink[dy0:ey, dx0:ex] |= sub
+    return ink, plotted
+
+
+def _render_bbc(cells, size, levels, dots, radius_lut):
+    """Faithful preview of the on-device algorithm with an explicit radius LUT.
+
+    Cell-lookup mode: takes pre-quantised cells (luminance encoding,
+    0=dark .. L-1=light), and at each R2 sample reads the matching cell
+    from the size×size grid.
+    """
+    darkness_grid = (levels - 1) - cells       # 0=light, levels-1=dark
+    xs, ys = r2_sequence_asm(dots)
+    # Mirror y: the BBC has y=0 at the BOTTOM of the screen, so the R2 step
+    # ys=0,1,2... walks bottom-up on its display. Mirroring here makes the
+    # preview's streak direction match the emulator while keeping the image
+    # itself right-side up (we sample and stamp at the same mirrored y).
+    ys = (255 - ys.astype(np.int32)).astype(np.uint8)
+    iy = (ys.astype(np.int32) * size) // 256
+    ix = (xs.astype(np.int32) * size) // 256
+    cell_vals = darkness_grid[iy, ix]
+    lut = np.asarray(radius_lut, dtype=np.int32)
+    radii = lut[np.clip(cell_vals, 0, len(lut) - 1)]
+    ink, plotted = _stamp_dots(xs, ys, radii)
     return ink, radii, plotted
+
+
+def _build_dot_script(dark, levels, n_dots, dither):
+    """Option 2: 64 B of source = a sequence of per-iteration darkness levels.
+
+    For each R2 iteration i ∈ [0, n_dots), sample the source darkness at the
+    R2 position (no 16×16 cell grid involved), quantise to `levels`, pack at
+    `bits_per` bits per dot. On device the byte stream is replayed in lockstep
+    with R2: the i-th stored level supplies the radius for the i-th dot. This
+    trades the grid resolution (16×16 = 256 cells, one cell drives MANY dots)
+    for sample resolution (256 dots, ONE value per dot) at the same data rate.
+
+    Returns (xs, ys, darkness_per_dot, packed_bytes).
+    """
+    H, W = dark.shape
+    if dither.startswith("ordered"):
+        bayer = np.array([[ 0,  8,  2, 10],
+                          [12,  4, 14,  6],
+                          [ 3, 11,  1,  9],
+                          [15,  7, 13,  5]], dtype=np.float64) / 16.0 - 0.5
+        m = bayer[np.arange(H)[:, None] % 4, np.arange(W)[None, :] % 4]
+        sample_field = np.clip(dark + m / max(levels - 1, 1), 0.0, 1.0)
+    else:
+        # F-S is spatially diffuse; on a sparse R2 sampling the diffusion
+        # rarely reaches the actual sample point, so it's not meaningfully
+        # different from 'none' here. Skip it in script mode.
+        sample_field = dark
+
+    xs, ys = r2_sequence_asm(n_dots)
+    # Mirror y to match BBC y-up convention (see _render_bbc).
+    ys = (255 - ys.astype(np.int32)).astype(np.uint8)
+    samples = sample_field[ys.astype(np.int32), xs.astype(np.int32)]
+    # quantise darkness 0..1 to integer level 0..L-1 (0=light, L-1=dark)
+    dlevels = np.clip(np.round(samples * (levels - 1)).astype(np.int32),
+                      0, levels - 1)
+    bits_per = max(1, int(np.ceil(np.log2(levels))))
+    packed = st.pack_bits(dlevels.tolist(), bits_per)
+    return xs, ys, dlevels, packed
+
+
+def _render_dot_script(dark, levels, n_dots, radius_lut, dither):
+    """Render mode 2: R2 placement + per-iteration radius LUT lookup."""
+    xs, ys, dlevels, packed = _build_dot_script(dark, levels, n_dots, dither)
+    lut = np.asarray(radius_lut, dtype=np.int32)
+    radii = lut[np.clip(dlevels, 0, len(lut) - 1)]
+    ink, plotted = _stamp_dots(xs, ys, radii)
+    return ink, radii, plotted, packed
+
+
+def _script_radii_image(xs, ys, radii, max_r):
+    """Visualisation for the 'stored bytes' panel in dot-script mode.
+
+    Draws a 256×256 grayscale where each dot's *radius* is plotted at its
+    iteration position (R2 (x,y)), normalised to 0..255. Lighter = bigger
+    radius. Gives a sense of which regions the script targets and how the
+    radii distribute over the canvas without obscuring the underlying tone.
+    """
+    img = np.full((256, 256), 230, dtype=np.uint8)   # pale background
+    if max_r <= 0:
+        return img
+    for x, y, r in zip(xs, ys, radii):
+        v = int(255 * (1.0 - r / max_r))             # bigger r -> darker
+        img[int(y), int(x)] = v
+    return img
+
+
+DATA_MODES = [
+    "cell lookup (16×16 grid)",
+    "dot script (per-iteration radii)",
+]
 
 
 def render(picker, upload, fit, gamma, brightness, contrast, posterize,
            black_point, white_point, size, levels, dots,
-           radius_preset, radius_text, dither):
+           radius_preset, radius_text, dither, data_mode):
     img = _resolve_image(picker, upload)
     if img is None:
         blank = np.full((256, 256), 255, dtype=np.uint8)
@@ -223,22 +344,43 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
     size = int(size)
     levels = int(levels)
     dots = int(dots)
-
-    cells = _downsample_dither(dark, size, levels, dither)
     bits_per = max(1, int(np.ceil(np.log2(levels))))
-
-    cells_dev = np.flipud((levels - 1) - cells)
-    src_bytes = st.pack_bits(cells_dev.ravel(), bits_per)
-
-    cell_lum = (cells.astype(np.float64) / max(levels - 1, 1) * 255.0).astype(np.uint8)
-    cells_img = _cells_preview(cell_lum)
-
     lut = _parse_lut(radius_text, levels)
-    ink, radii, plotted = _render_bbc(cells, size, levels, dots, lut)
-    stipple_img = np.where(ink, 0, 255).astype(np.uint8)
-
-    raw_bytes = len(src_bytes)
     code_est = 191  # current asm reality (see docs/STIPPLE-256.md)
+    data_budget = 64  # bytes the data section currently has room for
+
+    if data_mode.startswith("dot script"):
+        # script mode: data is per-iteration radii, n_dots = budget × 8 / bits_per
+        n_dots = (data_budget * 8) // bits_per
+        ink, radii, plotted, packed = _render_dot_script(
+            dark, levels, n_dots, lut, dither)
+        stipple_img = np.where(ink, 0, 255).astype(np.uint8)
+        raw_bytes = len(packed)
+
+        # cells panel: render the per-dot radii as a sparse "where the dots
+        # land and how big" preview so you can compare against the source.
+        xs_p, ys_p = r2_sequence_asm(n_dots)
+        ys_p = (255 - ys_p.astype(np.int32)).astype(np.uint8)
+        cells_img = _script_radii_image(xs_p, ys_p, radii, int(max(lut) if lut else 0))
+        mode_descr = (
+            f"**Mode**: dot script — {n_dots} dots × {bits_per}b = {raw_bytes} B "
+            f"({dither} dither {'(applied)' if dither.startswith('ordered') else '(ignored — F-S irrelevant for point samples)'})"
+        )
+    else:
+        # cell-lookup mode (the current asm)
+        cells = _downsample_dither(dark, size, levels, dither)
+        cells_dev = np.flipud((levels - 1) - cells)
+        packed = st.pack_bits(cells_dev.ravel(), bits_per)
+        cell_lum = (cells.astype(np.float64) / max(levels - 1, 1) * 255.0).astype(np.uint8)
+        cells_img = _cells_preview(cell_lum)
+        ink, radii, plotted = _render_bbc(cells, size, levels, dots, lut)
+        stipple_img = np.where(ink, 0, 255).astype(np.uint8)
+        raw_bytes = len(packed)
+        mode_descr = (
+            f"**Mode**: cell lookup — {size}×{size} @ {bits_per}bpp = {raw_bytes} B "
+            f"({dither} dither), {dots} R2 iters"
+        )
+
     total = code_est + raw_bytes
     over = total - 256
 
@@ -248,10 +390,9 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
 
     lut_str = ",".join(str(v) for v in lut)
     info = (
-        f"**Source**: {size}×{size} @ {bits_per}bpp = {raw_bytes} B raw "
-        f"({dither} dither)  \n"
+        f"{mode_descr}  \n"
         f"**Radius LUT**: cell→radius = [{lut_str}]  \n"
-        f"**Dots**: {dots} attempted, {plotted} plotted (r>0)  \n"
+        f"**Dots plotted (r>0)**: {plotted}  \n"
         f"**Radius histogram**: {hist}  \n"
         f"**Byte budget**: code≈{code_est} + data={raw_bytes} = **{total}** "
         f"({'OK, ' + str(256 - total) + ' B spare' if over <= 0 else 'OVER by ' + str(over) + ' B'})"
@@ -261,7 +402,8 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
 
 def reset_defaults():
     return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 768,
-            "cell×2 (current BBC: 0,2,4,6)", "0,2,4,6", "none")
+            "cell×2 (current BBC: 0,2,4,6)", "0,2,4,6", "none",
+            "cell lookup (16×16 grid)")
 
 
 def apply_preset(name, current_text, levels):
@@ -321,6 +463,15 @@ def build_ui():
                     DITHER_MODES, value="none", label="dither mode",
                     info="F-S diffuses quantisation error; ordered adds a Bayer threshold pattern.",
                 )
+                gr.Markdown("### Data interpretation (Option 2 toggle)")
+                data_mode = gr.Radio(
+                    DATA_MODES, value="cell lookup (16×16 grid)",
+                    label="how the 64 B of source data is read",
+                    info=("'cell lookup' = current asm: 16×16×{levels} grid sampled per dot. "
+                          "'dot script' = data is a sequence of per-iteration radii "
+                          "(256 dots × 2 bits = 64 B at L=4). One sample per dot — "
+                          "more detail at edges, fewer dots total."),
+                )
                 reset_btn = gr.Button("Reset defaults")
             with gr.Column(scale=2):
                 with gr.Row():
@@ -334,7 +485,7 @@ def build_ui():
 
         controls = [picker, upload, fit, gamma, brightness, contrast, posterize,
                     black_point, white_point, size, levels, dots,
-                    radius_preset, radius_text, dither]
+                    radius_preset, radius_text, dither, data_mode]
         outputs = [lum_out, cells_out, stipple_out, info]
 
         for c in controls:
@@ -348,7 +499,7 @@ def build_ui():
         reset_btn.click(
             reset_defaults, [],
             [fit, gamma, brightness, contrast, posterize, black_point, white_point,
-             size, levels, dots, radius_preset, radius_text, dither],
+             size, levels, dots, radius_preset, radius_text, dither, data_mode],
         ).then(render, controls, outputs)
 
         demo.load(render, controls, outputs)
