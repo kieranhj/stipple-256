@@ -22,8 +22,9 @@ XINC    = &C142
 YINC    = &91DF
 
 ; --- zero page ---
+; xa/ya/cnt_lo MUST stay contiguous at $7C..$80 — the zero-init loop relies
+; on it. r lives in X (no ZP slot) — see "tax" after the asl/sbc.
 buf     = &70           ; 6 bytes: [25, k, xL, xH, yL, yH]
-r       = &76
 xa      = &7C
 ya      = &7E
 cnt_lo  = &80
@@ -42,27 +43,29 @@ GUARD &7C00
     dex
     bpl vinit
 
-    lda #25 : sta buf+0
+    ; --- A = 0 free here (vdutab[0] = 0 was the last byte read by vinit). ---
+    ; Zero xa, xa+1, ya, ya+1, cnt_lo in one indexed loop (5 contiguous ZP).
+    ldx #4
+.zerolp
+    sta xa,x                         ; sta &7C,x  (zp,x mode)
+    dex
+    bpl zerolp
 
-    lda #0
-    sta xa : sta xa+1
-    sta ya : sta ya+1
-    sta cnt_lo
+    lda #25 : sta buf+0
 
     lda #8
     sta cnt_hi                       ; 16-bit counter = $0800 = 2048 iters
 
 .loop
-    ; --- R2 ---
-    clc
-    lda xa   : adc #LO(XINC) : sta xa
-    lda xa+1 : adc #HI(XINC) : sta xa+1
+    ; --- R2 --- (ya first so A = xa+1 falls through into the cell lookup)
     clc
     lda ya   : adc #LO(YINC) : sta ya
     lda ya+1 : adc #HI(YINC) : sta ya+1
+    clc
+    lda xa   : adc #LO(XINC) : sta xa
+    lda xa+1 : adc #HI(XINC) : sta xa+1
 
-    ; --- image lookup (16x16 @ 2bpp LSB-first) ---
-    lda xa+1
+    ; --- image lookup (16x16 @ 2bpp LSB-first); A = xa+1 already ---
     lsr A : lsr A : lsr A : lsr A
     sta tmp
     lda ya+1
@@ -88,7 +91,9 @@ GUARD &7C00
     beq skip_dot
     asl A
     sbc #0                           ; r = cell*2 - 1 -> {1, 3, 5} (odd radii;
-    sta r                            ; carry is clear after asl since cell<=3)
+    tax                              ; carry is clear after asl since cell<=3)
+                                     ; r lives in X across emit6 (OSWRCH and
+                                     ; emit6 both preserve X).
 
     ; --- gx = px*4 -> buf+2..3 ---
     lda xa+1
@@ -114,7 +119,7 @@ GUARD &7C00
 
     ; --- mutate for PLOT (k=157, x += r*4) ---
     lda #157 : sta buf+1
-    lda r
+    txa                              ; A = r (was stashed in X above)
     asl A : asl A                    ; r*4; carry clear since r<=7
     adc buf+2 : sta buf+2
     bcc emit_plot
@@ -123,13 +128,13 @@ GUARD &7C00
     jsr emit6
 
 .skip_dot
-    ; --- 16-bit counter decrement; halt at zero ---
-    lda cnt_lo
-    bne dec_lo
-    dec cnt_hi
-    bmi hang
-.dec_lo
+    ; --- 16-bit counter decrement; halt when cnt_hi rolls 1->0.
+    ; Equivalent to old "test then dec" but 2 bytes shorter.
     dec cnt_lo
+    bne not_yet
+    dec cnt_hi
+    beq hang
+.not_yet
     jmp loop
 
 .emit6
