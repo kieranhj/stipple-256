@@ -375,12 +375,70 @@ def _script_radii_image(xs, ys, radii, max_r):
 DATA_MODES = [
     "cell lookup (16×16 grid)",
     "dot script (per-iteration radii)",
+    "rejection sample (density)",
 ]
+
+
+REJECT_HASH_MODES = [
+    "pseudo (xa^ya mod L)",
+    "pseudo (LFSR low bits)",
+    "uniform (ideal reference)",
+]
+
+
+def _render_rejection(dark, size, levels, n_iters, fixed_r, hash_mode):
+    """Option 1 prototype: probability-density rejection sampling.
+
+    Same 64 B of data as cell-lookup mode (16×16 × log2(L) bits). At each R2
+    sample, look up the cell darkness d ∈ [0, L-1] and a pseudo-random
+    h ∈ [0, L-1]; plot a fixed-radius dot iff h < d. Tone is rendered by
+    *dot density*, not dot size, so dark regions get a dense uniform speckle
+    and light regions are sparse — no big-r overlap clumping.
+
+    hash_mode:
+      - "pseudo (xa^ya)" — what the BBC asm would compute cheaply
+        (eor xa,ya ; and #(L-1)). Correlated with R2, but works.
+      - "pseudo (LFSR)"  — drive a third LFSR alongside R2; take low bits.
+        Better-distributed pseudo-random source, costs ~6 more asm bytes.
+      - "uniform"        — numpy RNG, ideal-quality reference.
+    """
+    cells = _downsample_dither(dark, size, levels, "none")
+    darkness = (levels - 1) - cells               # 0=light .. L-1=dark
+
+    xs, ys = r2_sequence_asm(n_iters)
+    ys = (255 - ys.astype(np.int32)).astype(np.uint8)
+    ix = (xs.astype(np.int32) * size) // 256
+    iy = (ys.astype(np.int32) * size) // 256
+    d = darkness[iy, ix].astype(np.int32)
+
+    if hash_mode.startswith("pseudo (xa^ya"):
+        h = (xs.astype(np.int32) ^ ys.astype(np.int32)) & (levels - 1)
+    elif hash_mode.startswith("pseudo (LFSR"):
+        # Galois LFSR, tap 0xB400, seed 0xACE1 (arbitrary nonzero)
+        state = 0xACE1
+        h = np.empty(n_iters, dtype=np.int32)
+        for i in range(n_iters):
+            lsb = state & 1
+            state >>= 1
+            if lsb:
+                state ^= 0xB400
+            h[i] = state & (levels - 1)
+    else:
+        rng = np.random.default_rng(12345)
+        h = rng.integers(0, levels, size=n_iters)
+
+    accept = h < d
+    keep_xs = xs[accept]
+    keep_ys = ys[accept]
+    radii = np.full(keep_xs.shape, fixed_r, dtype=np.int32)
+    ink, plotted = _stamp_dots(keep_xs, keep_ys, radii)
+    return ink, radii, plotted, cells, int(accept.sum())
 
 
 def render(picker, upload, fit, gamma, brightness, contrast, posterize,
            black_point, white_point, size, levels, dots,
-           radius_preset, radius_text, dither, data_mode, script_sampling):
+           radius_preset, radius_text, dither, data_mode, script_sampling,
+           reject_radius, reject_hash):
     img = _resolve_image(picker, upload)
     if img is None:
         blank = np.full((256, 256), 255, dtype=np.uint8)
@@ -397,7 +455,27 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
     code_est = 191  # current asm reality (see docs/STIPPLE-256.md)
     data_budget = 64  # bytes the data section currently has room for
 
-    if data_mode.startswith("dot script"):
+    if data_mode.startswith("rejection"):
+        fixed_r = int(reject_radius)
+        ink, radii, plotted, cells, accepted = _render_rejection(
+            dark, size, levels, dots, fixed_r, reject_hash)
+        stipple_img = np.where(ink, 0, 255).astype(np.uint8)
+        cells_dev = np.flipud((levels - 1) - cells)
+        packed = st.pack_bits(cells_dev.ravel(), bits_per)
+        cell_lum = (cells.astype(np.float64) / max(levels - 1, 1) * 255.0).astype(np.uint8)
+        cells_img = _cells_preview(cell_lum)
+        raw_bytes = len(packed)
+        # rejection asm is bigger than cell-lookup: ~+8 bytes for the
+        # hash+compare+conditional, ~-3 saved by dropping the cell→radius
+        # LUT (fixed r becomes an immediate). Rough estimate.
+        code_est = 196
+        accept_pct = (100.0 * accepted / max(dots, 1))
+        mode_descr = (
+            f"**Mode**: rejection sample ({reject_hash}) — "
+            f"{size}×{size} @ {bits_per}bpp = {raw_bytes} B, fixed r={fixed_r}, "
+            f"{dots} R2 iters → {accepted} kept ({accept_pct:.1f}% accept rate)"
+        )
+    elif data_mode.startswith("dot script"):
         # script mode: data is per-iteration radii. size×size = total dot
         # count, byte count = (size² × bits_per) / 8. Same semantics for size
         # as cell-lookup mode (data points per axis), just laid out as a
@@ -455,7 +533,8 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
 def reset_defaults():
     return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 2048,
             "odd (0,1,3,5)", "0,1,3,5", "none",
-            "cell lookup (16×16 grid)", "bilinear")
+            "cell lookup (16×16 grid)", "bilinear",
+            2, "pseudo (xa^ya mod L)")
 
 
 def apply_preset(name, current_text, levels):
@@ -540,6 +619,19 @@ def build_ui():
                           "Free on-device — the BBC still plots at the same integer "
                           "position; bilinear only changes the offline-baked radius."),
                 )
+                gr.Markdown("### Rejection sampling (Option 1 only)")
+                reject_radius = gr.Slider(
+                    1, 4, value=2, step=1,
+                    label="fixed dot radius",
+                    info="All accepted dots use this radius. Tone is rendered by density, not size.",
+                )
+                reject_hash = gr.Radio(
+                    REJECT_HASH_MODES, value="pseudo (xa^ya mod L)",
+                    label="hash source for accept/reject",
+                    info=("'xa^ya' = the cheapest on-device hash (~5 bytes asm). "
+                          "'LFSR' = better-distributed pseudo-random (~+6 bytes asm). "
+                          "'uniform' = numpy RNG, ideal-quality reference (cannot be implemented in asm)."),
+                )
                 reset_btn = gr.Button("Reset defaults")
             with gr.Column(scale=2):
                 with gr.Row():
@@ -553,7 +645,8 @@ def build_ui():
 
         controls = [picker, upload, fit, gamma, brightness, contrast, posterize,
                     black_point, white_point, size, levels, dots,
-                    radius_preset, radius_text, dither, data_mode, script_sampling]
+                    radius_preset, radius_text, dither, data_mode, script_sampling,
+                    reject_radius, reject_hash]
         outputs = [lum_out, cells_out, stipple_out, info]
 
         for c in controls:
@@ -568,7 +661,7 @@ def build_ui():
             reset_defaults, [],
             [fit, gamma, brightness, contrast, posterize, black_point, white_point,
              size, levels, dots, radius_preset, radius_text, dither, data_mode,
-             script_sampling],
+             script_sampling, reject_radius, reject_hash],
         ).then(render, controls, outputs)
 
         demo.load(render, controls, outputs)
