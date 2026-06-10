@@ -149,6 +149,7 @@ def _cells_preview(cells_lum):
 # is the source of truth.
 RADIUS_PRESETS = {
     "cell×2 (current BBC: 0,2,4,6)": [0, 2, 4, 6],
+    "odd (0,1,3,5)": [0, 1, 3, 5],
     "cell (earlier smaller: 0,1,2,3)": [0, 1, 2, 3],
     "wide (0,2,4,7)": [0, 2, 4, 7],
     "binary (0,0,4,4)": [0, 0, 4, 4],
@@ -452,8 +453,8 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
 
 
 def reset_defaults():
-    return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 768,
-            "cell×2 (current BBC: 0,2,4,6)", "0,2,4,6", "none",
+    return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 2048,
+            "odd (0,1,3,5)", "0,1,3,5", "none",
             "cell lookup (16×16 grid)", "bilinear")
 
 
@@ -503,15 +504,15 @@ def build_ui():
                           "32×32=1024 dots = 256 B — exceeds budget but reveals visual ceiling)."),
                 )
                 levels = gr.Slider(2, 8, value=4, step=1, label="levels (4 = 2 bpp)")
-                dots = gr.Slider(64, 2048, value=768, step=32, label="R2 dot iterations")
+                dots = gr.Slider(64, 2048, value=2048, step=32, label="R2 dot iterations")
                 gr.Markdown("### Radius mapping (cell darkness → pixel radius)")
                 radius_preset = gr.Radio(
                     list(RADIUS_PRESETS.keys()),
-                    value="cell×2 (current BBC: 0,2,4,6)",
+                    value="odd (0,1,3,5)",
                     label="preset (picks one fills the textbox)",
                 )
                 radius_text = gr.Textbox(
-                    value="0,2,4,6",
+                    value="0,1,3,5",
                     label="LUT (cell 0 → cell L-1, comma-separated)",
                     info="Length should match levels. r=0 skips the dot.",
                 )

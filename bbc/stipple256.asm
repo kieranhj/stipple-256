@@ -1,10 +1,10 @@
 ; stipple256.asm - 256-byte stipple intro for the BBC Master.
 ; ---------------------------------------------------------------------------
 ; 16x16 @ 2bpp stored image (64 B). R2 placement (plastic-phi additive),
-; per-dot cell lookup, r = cell*2 -> {0,2,4,6} pixel radii (0 = skip).
+; per-dot cell lookup, r = cell*2-1 -> {0,1,3,5} pixel radii (0 = skip).
 ; GXR PLOT 157 (filled circle absolute, fg). Buffer-loop OSWRCH: a 6-byte
 ; VDU template is mutated and emitted twice per dot (MOVE then PLOT).
-; 16-bit zero-page counter for the 768-iteration dot loop (X is clobbered by
+; 16-bit zero-page counter for the 2048-iteration dot loop (X is clobbered by
 ; the image lookup so it can't be the counter).
 ;
 ; Build:  ..\tools\beebasm.exe -i stipple256.asm -do stipple256.ssd -boot STIP256 -v
@@ -49,8 +49,8 @@ GUARD &7C00
     sta ya : sta ya+1
     sta cnt_lo
 
-    lda #3
-    sta cnt_hi                       ; 16-bit counter = $0300 = 768 iters
+    lda #8
+    sta cnt_hi                       ; 16-bit counter = $0800 = 2048 iters
 
 .loop
     ; --- R2 ---
@@ -86,8 +86,9 @@ GUARD &7C00
 .sh_done
     and #3
     beq skip_dot
-    asl A                            ; r = cell * 2 -> {2, 4, 6} (bigger dots)
-    sta r
+    asl A
+    sbc #0                           ; r = cell*2 - 1 -> {1, 3, 5} (odd radii;
+    sta r                            ; carry is clear after asl since cell<=3)
 
     ; --- gx = px*4 -> buf+2..3 ---
     lda xa+1
@@ -114,8 +115,7 @@ GUARD &7C00
     ; --- mutate for PLOT (k=157, x += r*4) ---
     lda #157 : sta buf+1
     lda r
-    asl A : asl A
-    clc
+    asl A : asl A                    ; r*4; carry clear since r<=7
     adc buf+2 : sta buf+2
     bcc emit_plot
     inc buf+3
