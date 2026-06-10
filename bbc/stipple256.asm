@@ -24,7 +24,8 @@ YINC    = &91DF
 ; --- zero page ---
 ; xa/ya/cnt_lo MUST stay contiguous at $7C..$80 — the zero-init loop relies
 ; on it. r lives in X (no ZP slot) — see "tax" after the asl/sbc.
-buf     = &70           ; 6 bytes: [25, k, xL, xH, yL, yH]
+buf     = &70           ; 6 bytes: [yH, yL, xH, xL, k, 25]  (reversed; emit6
+                        ; counts Y down from 5 so buf[5]=25 is sent first).
 xa      = &7C
 ya      = &7E
 cnt_lo  = &80
@@ -51,7 +52,7 @@ GUARD &7C00
     dex
     bpl zerolp
 
-    lda #25 : sta buf+0
+    lda #25 : sta buf+5              ; emitted first (Y=5)
 
     lda #8
     sta cnt_hi                       ; 16-bit counter = $0800 = 2048 iters
@@ -95,35 +96,35 @@ GUARD &7C00
                                      ; r lives in X across emit6 (OSWRCH and
                                      ; emit6 both preserve X).
 
-    ; --- gx = px*4 -> buf+2..3 ---
+    ; --- gx = px*4 -> buf+3 (lo), buf+2 (hi) (reversed layout) ---
     lda xa+1
     asl A
-    sta buf+2
+    sta buf+3
     lda #0
     rol A
-    sta buf+3
-    asl buf+2 : rol buf+3
+    sta buf+2
+    asl buf+3 : rol buf+2
 
-    ; --- gy = py*4 -> buf+4..5 ---
+    ; --- gy = py*4 -> buf+1 (lo), buf+0 (hi) ---
     lda ya+1
     asl A
-    sta buf+4
+    sta buf+1
     lda #0
     rol A
-    sta buf+5
-    asl buf+4 : rol buf+5
+    sta buf+0
+    asl buf+1 : rol buf+0
 
     ; --- emit MOVE (k=4) ---
-    lda #4 : sta buf+1
+    lda #4 : sta buf+4
     jsr emit6
 
     ; --- mutate for PLOT (k=157, x += r*4) ---
-    lda #157 : sta buf+1
+    lda #157 : sta buf+4
     txa                              ; A = r (was stashed in X above)
     asl A : asl A                    ; r*4; carry clear since r<=7
-    adc buf+2 : sta buf+2
+    adc buf+3 : sta buf+3
     bcc emit_plot
-    inc buf+3
+    inc buf+2
 .emit_plot
     jsr emit6
 
@@ -142,13 +143,12 @@ GUARD &7C00
                                      ; shorter than jmp loop.
 
 .emit6
-    ldy #0
+    ldy #5                           ; emit buf[5], buf[4], ..., buf[0]
 .e6_lp
     lda buf,y
     jsr oswrch
-    iny
-    cpy #6
-    bne e6_lp
+    dey
+    bpl e6_lp                        ; dey/bpl is 3 B vs iny/cpy #6/bne = 5 B
     rts
 
 ; --- VDU init ---
