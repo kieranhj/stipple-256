@@ -129,13 +129,17 @@ GUARD &7C00
 
 .skip_dot
     ; --- 16-bit counter decrement; halt when cnt_hi rolls 1->0.
-    ; Equivalent to old "test then dec" but 2 bytes shorter.
     dec cnt_lo
     bne not_yet
     dec cnt_hi
-    beq hang
+.hang
+    beq hang                         ; serves double duty: first hit (cnt_hi=0)
+                                     ; branches to itself = infinite loop;
+                                     ; otherwise Z=0 falls through.
 .not_yet
-    jmp loop
+    bne loop                         ; Z=0 here (from dec cnt_lo via bne, or
+                                     ; dec cnt_hi via beq-not-taken). 1 B
+                                     ; shorter than jmp loop.
 
 .emit6
     ldy #0
@@ -146,9 +150,6 @@ GUARD &7C00
     cpy #6
     bne e6_lp
     rts
-
-.hang
-    jmp hang
 
 ; --- VDU init ---
 ; bytes stored in REVERSE; init loop reads them with X decreasing so they
