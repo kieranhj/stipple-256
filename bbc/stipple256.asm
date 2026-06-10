@@ -174,7 +174,7 @@ GUARD &7C00
                                      ; goes-to-graphics and behaves differently.
     EQUB 12                          ; CLS (clears text window to bg = white)
     EQUB 129, 17                     ; COLOUR 129 (text bg = logical 1 = white)
-    EQUB 4, 22                       ; MODE 4 (read first)
+    EQUB 0, 22                       ; MODE 4 (read first)
 vdulen = * - vdutab
 
 .image
