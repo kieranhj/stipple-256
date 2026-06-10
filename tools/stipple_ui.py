@@ -95,8 +95,14 @@ def _resolve_image(picker_value, upload_pil):
 
 
 def _preprocess(img, fit, gamma, brightness, contrast, posterize,
-                black_point, white_point):
-    """Run stipple.load_darkness equivalent on a PIL.Image; return (dark, lum_preview)."""
+                black_point, white_point, bbc_aspect=True):
+    """Run stipple.load_darkness equivalent on a PIL.Image; return (dark, lum_preview).
+
+    bbc_aspect=True fits to 320x256 (MODE 4's actual 5:4 screen aspect) so that
+    when the asm renders with gx*5 the on-screen image looks proportional.
+    bbc_aspect=False keeps the legacy 256x256 square fit (image appears
+    stretched 25% wider on the BBC).
+    """
     opts = SimpleNamespace(
         gamma=float(gamma),
         brightness=float(brightness),
@@ -111,7 +117,8 @@ def _preprocess(img, fit, gamma, brightness, contrast, posterize,
         bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
         img = Image.alpha_composite(bg, img)
     img = img.convert("L")
-    img = st._fit(img, 256, 256, fit)
+    W, H = (320, 256) if bbc_aspect else (256, 256)
+    img = st._fit(img, W, H, fit)
     lum = np.asarray(img, dtype=np.float64) / 255.0
 
     lo, hi = opts.black_point, opts.white_point
@@ -237,9 +244,8 @@ def _disc_mask_bbc(r):
     return (xx * xx + yy * yy) <= r * r + r
 
 
-def _stamp_dots(xs, ys, radii):
-    """Stamp filled circular discs onto a 256×256 ink map."""
-    W = H = 256
+def _stamp_dots(xs, ys, radii, W=256, H=256):
+    """Stamp filled circular discs onto a W×H ink map."""
     max_r = int(radii.max()) if len(radii) else 0
     ink = np.zeros((H, W), dtype=bool)
     masks = {r: _disc_mask_bbc(r) for r in range(max_r + 1)}
@@ -276,11 +282,16 @@ def _render_bbc(cells, size, levels, dots, radius_lut):
     # itself right-side up (we sample and stamp at the same mirrored y).
     ys = (255 - ys.astype(np.int32)).astype(np.uint8)
     iy = (ys.astype(np.int32) * size) // 256
+    # Cell-x index uses px (xs) unchanged — the cell grid is still 16 wide,
+    # the screen-fill scaling only affects WHERE on screen the dot lands.
     ix = (xs.astype(np.int32) * size) // 256
     cell_vals = darkness_grid[iy, ix]
     lut = np.asarray(radius_lut, dtype=np.int32)
     radii = lut[np.clip(cell_vals, 0, len(lut) - 1)]
-    ink, plotted = _stamp_dots(xs, ys, radii)
+    # Stretch x positions by 5/4 to model the BBC asm's gx*5 screen-fill:
+    # px ∈ 0..255 -> pixel 0..318 on the 320-wide MODE 4 canvas.
+    gx_pixels = (xs.astype(np.int32) * 5) // 4
+    ink, plotted = _stamp_dots(gx_pixels, ys, radii, W=320, H=256)
     return ink, radii, plotted
 
 
@@ -438,14 +449,15 @@ def _render_rejection(dark, size, levels, n_iters, fixed_r, hash_mode):
 def render(picker, upload, fit, gamma, brightness, contrast, posterize,
            black_point, white_point, size, levels, dots,
            radius_preset, radius_text, dither, data_mode, script_sampling,
-           reject_radius, reject_hash):
+           reject_radius, reject_hash, bbc_aspect):
     img = _resolve_image(picker, upload)
     if img is None:
         blank = np.full((256, 256), 255, dtype=np.uint8)
         return blank, blank, blank, "Pick or upload an image."
 
     dark, lum_preview = _preprocess(
-        img, fit, gamma, brightness, contrast, posterize, black_point, white_point)
+        img, fit, gamma, brightness, contrast, posterize, black_point, white_point,
+        bbc_aspect=bool(bbc_aspect))
 
     size = int(size)
     levels = int(levels)
@@ -534,7 +546,7 @@ def reset_defaults():
     return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 2048,
             "odd (0,1,3,5)", "0,1,3,5", "none",
             "cell lookup (16×16 grid)", "bilinear",
-            2, "pseudo (xa^ya mod L)")
+            2, "pseudo (xa^ya mod L)", True)
 
 
 def apply_preset(name, current_text, levels):
@@ -567,6 +579,14 @@ def build_ui():
                 upload = gr.Image(type="pil", label="...or upload (overrides picker)",
                                   height=200)
                 fit = gr.Radio(["cover", "contain"], value="cover", label="fit")
+                bbc_aspect = gr.Checkbox(
+                    value=True,
+                    label="BBC aspect (5:4 fit, compensates gx*5 stretch)",
+                    info=("ON: source is fit to 320x256 (BBC MODE 4 aspect) so "
+                          "the on-screen image looks proportional. OFF: legacy "
+                          "256x256 square fit — image appears stretched 25% "
+                          "wider on the BBC."),
+                )
                 gr.Markdown("### Preprocessing")
                 gamma = gr.Slider(0.2, 4.0, value=1.0, step=0.05, label="gamma (>1 lightens midtones)")
                 brightness = gr.Slider(-0.5, 0.5, value=0.0, step=0.01, label="brightness")
@@ -646,7 +666,7 @@ def build_ui():
         controls = [picker, upload, fit, gamma, brightness, contrast, posterize,
                     black_point, white_point, size, levels, dots,
                     radius_preset, radius_text, dither, data_mode, script_sampling,
-                    reject_radius, reject_hash]
+                    reject_radius, reject_hash, bbc_aspect]
         outputs = [lum_out, cells_out, stipple_out, info]
 
         for c in controls:
@@ -661,7 +681,7 @@ def build_ui():
             reset_defaults, [],
             [fit, gamma, brightness, contrast, posterize, black_point, white_point,
              size, levels, dots, radius_preset, radius_text, dither, data_mode,
-             script_sampling, reject_radius, reject_hash],
+             script_sampling, reject_radius, reject_hash, bbc_aspect],
         ).then(render, controls, outputs)
 
         demo.load(render, controls, outputs)

@@ -96,14 +96,21 @@ GUARD &7C00
                                      ; r lives in X across emit6 (OSWRCH and
                                      ; emit6 both preserve X).
 
-    ; --- gx = px*4 -> buf+3 (lo), buf+2 (hi) (reversed layout) ---
+    ; --- gx = px*5 -> buf+3 (lo), buf+2 (hi) (reversed layout)
+    ; px*5 = px*4 + px. Stretches the dot field from 256 px wide to ~318 px
+    ; wide so it fills MODE 4's 320 px width instead of leaving a right gap.
     lda xa+1
     asl A
     sta buf+3
     lda #0
     rol A
     sta buf+2
-    asl buf+3 : rol buf+2
+    asl buf+3 : rol buf+2            ; buf+3:buf+2 = px*4
+    clc
+    lda buf+3 : adc xa+1 : sta buf+3 ; += px (low byte)
+    bcc gx_no_carry
+    inc buf+2                         ; propagate the carry into hi
+.gx_no_carry
 
     ; --- gy = py*4 -> buf+1 (lo), buf+0 (hi) ---
     lda ya+1
@@ -138,9 +145,10 @@ GUARD &7C00
                                      ; branches to itself = infinite loop;
                                      ; otherwise Z=0 falls through.
 .not_yet
-    bne loop                         ; Z=0 here (from dec cnt_lo via bne, or
-                                     ; dec cnt_hi via beq-not-taken). 1 B
-                                     ; shorter than jmp loop.
+    jmp loop                         ; back-edge to .loop; was `bne loop` when
+                                     ; the loop body was small enough to reach
+                                     ; it in a -128 branch, but gx*5 grew the
+                                     ; body past the branch limit.
 
 .emit6
     ldy #5                           ; emit buf[5], buf[4], ..., buf[0]
