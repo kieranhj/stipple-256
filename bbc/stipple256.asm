@@ -36,30 +36,29 @@ ORG &1900
 GUARD &7C00
 
 .start
-    ; --- VDU init, sent in reverse via dex/bpl (saves 2 bytes vs forward) ---
+    ; --- VDU init + ZP clear in one loop ---
+    ; vinit sweeps X from vdulen-1 down to 0, emitting vdutab[X] to OSWRCH.
+    ; sty `buf+3,X` piggy-backs on the same X to write 0 across a 14-byte
+    ; ZP swath ($73..$80) — overkill (only $7C..$80 actually need zeroing
+    ; for xa, xa+1, ya, ya+1, cnt_lo) but the extras are harmless:
+    ;   $73..$75 = buf+3..buf+5 (overwritten in main loop body anyway)
+    ;   $76..$7B = unused
+    ;   $7C..$80 = the wanted zeros (xa..cnt_lo)
+    ; cnt_hi at $81 is NOT touched (X stops at 13 with current vdulen=14)
+    ; so its stx-stash above survives the loop. Saves ~3 B vs a separate
+    ; zerolp loop.
     ldx #vdulen-1
     stx cnt_hi                       ; 16-bit iter counter = vdulen-1 in hi byte.
                                      ; With current vdutab (14 bytes incl. VDU 29
                                      ; origin centring), vdulen-1 = 13, so the
                                      ; counter starts at $0D00 = 3328 iters.
-                                     ; Stashing X here is free (2 B); the
-                                     ; alternative `lda # / sta cnt_hi` is 4 B.
-                                     ; Iter count is whatever vdulen-1 happens
-                                     ; to be — if you ever want to lock it to
-                                     ; a specific value, add explicit init here.
+    ldy #0
 .vinit
     lda vdutab,x
     jsr oswrch
+    sty buf+3,x                      ; zero $73+X (= buf+3+X)
     dex
     bpl vinit
-
-    ; --- A = 0 free here (vdutab[0] = 0 was the last byte read by vinit). ---
-    ; Zero xa, xa+1, ya, ya+1, cnt_lo in one indexed loop (5 contiguous ZP).
-    ldx #4
-.zerolp
-    sta xa,x                         ; sta &7C,x  (zp,x mode)
-    dex
-    bpl zerolp
 
     lda #25 : sta buf+5              ; emitted first (Y=5)
 
