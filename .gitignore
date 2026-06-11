@@ -7,6 +7,10 @@ stipple_out/
 out_*/
 bbc/data/.build_tmp/
 
+# beebasm listing + symbol dump (regenerated on every build)
+bbc/*.lst
+bbc/*.labels
+
 # tooling binary (download separately)
 tools/beebasm.exe
 

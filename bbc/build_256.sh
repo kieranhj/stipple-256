@@ -74,7 +74,16 @@ echo "   wrote bbc/data/mona16.bin (from $STEM)"
 
 # --- 2. assemble ---
 cd "$BBC_DIR"
-out=$(../tools/beebasm.exe -i stipple256.asm -do stipple256.ssd -boot STIP256 -v 2>&1)
+# -v dumps the per-instruction listing to stdout; capture for later parsing
+# AND save to a file so the user can inspect free space / opcode density.
+# -dd dumps every global and local label after assembly to LABELS_FILE.
+LIST_FILE="stipple256.lst"
+LABELS_FILE="stipple256.labels"
+out=$(../tools/beebasm.exe -i stipple256.asm -do stipple256.ssd -boot STIP256 \
+        -v -dd -labels "$LABELS_FILE" 2>&1)
+# Strip CR (beebasm.exe on win prints CRLF; we want clean LF in the listing).
+printf '%s\n' "$out" | tr -d '\r' > "$LIST_FILE"
+# Also echo to console so existing CI / interactive use keeps working.
 echo "$out"
 
 # Size report: code runs from $1900 to whatever address precedes `.image`,
@@ -95,6 +104,8 @@ if [ -n "$last_code_addr" ]; then
     else
         echo "  ${code_bytes} B code + ${image_bytes} B image = ${total} / 256  (spare: ${spare})"
     fi
+    echo "  listing: bbc/${LIST_FILE}"
+    echo "  labels:  bbc/${LABELS_FILE}"
 else
     echo
     echo "wrote: stipple256.ssd  (size report skipped — couldn't parse listing)"
