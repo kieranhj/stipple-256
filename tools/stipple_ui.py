@@ -38,6 +38,42 @@ PICS_DIR = REPO_ROOT / "pics"
 XINC_ASM = 0xC142
 YINC_ASM = 0x91DF
 
+# --- LFSR placement (alternative to R2) --------------------------------------
+# A 16-bit Galois right-shift LFSR sampled at two phase offsets into its
+# 65535-long cycle. The "diagonal weave" patterns came out of this with the
+# default tap 0xB400; see tools/lfsr_brute.py for the brute force that found
+# seeds like (58372, 12530) for the eye image, and docs/STIPPLE-256-LFSR.md
+# for the analysis.
+LFSR_TAP_DEFAULT = 0xB400
+
+
+def build_lfsr_cycle(tap=LFSR_TAP_DEFAULT):
+    cyc = np.empty(65535, dtype=np.uint8)
+    s = 1
+    for i in range(65535):
+        cyc[i] = s >> 8
+        out = s & 1
+        s >>= 1
+        if out:
+            s ^= tap
+    return cyc
+
+
+# Cache LFSR cycles per tap — rebuilding 65k entries on every UI tick is wasteful.
+_LFSR_CYCLE_CACHE: dict[int, np.ndarray] = {}
+
+
+def lfsr_sequence(n, x_off, y_off, tap=LFSR_TAP_DEFAULT):
+    """One shared LFSR hi-byte cycle read at two phase offsets."""
+    if tap not in _LFSR_CYCLE_CACHE:
+        _LFSR_CYCLE_CACHE[tap] = build_lfsr_cycle(tap)
+    cycle = _LFSR_CYCLE_CACHE[tap]
+    L = len(cycle)
+    idx = np.arange(n)
+    xs = cycle[(int(x_off) + idx) % L]
+    ys = cycle[(int(y_off) + idx) % L]
+    return xs, ys
+
 
 def r2_sequence_asm(n):
     """Mirror the 6502 R2 with the exact asm constants. Returns uint8 xs, ys."""
@@ -268,38 +304,47 @@ def _stamp_dots(xs, ys, radii, W=256, H=256):
     return ink, plotted
 
 
-def _render_bbc(cells, size, levels, dots, radius_lut):
-    """Faithful preview of the on-device algorithm with an explicit radius LUT.
+def _render_bbc_from_seq(cells, size, levels, xs, ys, radius_lut):
+    """Faithful preview of the on-device cell-lookup algorithm from a given
+    (xs, ys) sequence of hi-bytes. Used for both R2 and LFSR placements.
 
-    Cell-lookup mode: takes pre-quantised cells (luminance encoding,
-    0=dark .. L-1=light), and at each R2 sample reads the matching cell
-    from the size×size grid.
+    Mirror y: the BBC has y=0 at the BOTTOM of the screen, so the source step
+    ys=0,1,2... walks bottom-up on its display. Mirroring here makes the
+    preview's streak direction match the emulator while keeping the image
+    itself right-side up (we sample and stamp at the same mirrored y).
+
+    Model the BBC asm's gx*5 screen-fill at MODE 4 resolution (320x256).
+    The asm now targets MODE 0 (640x256 pixel grid) but MOS VDU units are
+    resolution-independent: PLOT 157 produces a physically round dot at
+    the same physical size in either mode, and the screen aspect stays
+    5:4. MODE 0 just gives finer pixel granularity along the dot edges
+    (smoother circles on hardware). Previewing at 320x256 is a faithful
+    physical-aspect view — the smoother-edge benefit only shows on
+    actual hardware / jsbeeb.
     """
     darkness_grid = (levels - 1) - cells       # 0=light, levels-1=dark
-    xs, ys = r2_sequence_asm(dots)
-    # Mirror y: the BBC has y=0 at the BOTTOM of the screen, so the R2 step
-    # ys=0,1,2... walks bottom-up on its display. Mirroring here makes the
-    # preview's streak direction match the emulator while keeping the image
-    # itself right-side up (we sample and stamp at the same mirrored y).
     ys = (255 - ys.astype(np.int32)).astype(np.uint8)
     iy = (ys.astype(np.int32) * size) // 256
-    # Cell-x index uses px (xs) unchanged — the cell grid is still 16 wide,
-    # the screen-fill scaling only affects WHERE on screen the dot lands.
     ix = (xs.astype(np.int32) * size) // 256
     cell_vals = darkness_grid[iy, ix]
     lut = np.asarray(radius_lut, dtype=np.int32)
     radii = lut[np.clip(cell_vals, 0, len(lut) - 1)]
-    # Model the BBC asm's gx*5 screen-fill at MODE 4 resolution (320x256).
-    # The asm now targets MODE 0 (640x256 pixel grid) but MOS VDU units are
-    # resolution-independent: PLOT 157 produces a physically round dot at
-    # the same physical size in either mode, and the screen aspect stays
-    # 5:4. MODE 0 just gives finer pixel granularity along the dot edges
-    # (smoother circles on hardware). Previewing at 320x256 is a faithful
-    # physical-aspect view — the smoother-edge benefit only shows on
-    # actual hardware / jsbeeb.
     gx_pixels = (xs.astype(np.int32) * 5) // 4
     ink, plotted = _stamp_dots(gx_pixels, ys, radii, W=320, H=256)
     return ink, radii, plotted
+
+
+def _render_bbc(cells, size, levels, dots, radius_lut):
+    """Cell-lookup mode with R2 placement (current shipped asm)."""
+    xs, ys = r2_sequence_asm(dots)
+    return _render_bbc_from_seq(cells, size, levels, xs, ys, radius_lut)
+
+
+def _render_bbc_lfsr(cells, size, levels, dots, radius_lut, x_off, y_off, tap):
+    """Cell-lookup mode with LFSR placement (a 16-bit Galois LFSR cycle
+    sampled at two phase offsets — see lfsr_sequence)."""
+    xs, ys = lfsr_sequence(dots, x_off, y_off, tap)
+    return _render_bbc_from_seq(cells, size, levels, xs, ys, radius_lut)
 
 
 def _build_dot_script(dark, levels, n_dots, dither, sampling):
@@ -456,11 +501,12 @@ def _render_rejection(dark, size, levels, n_iters, fixed_r, hash_mode):
 def render(picker, upload, fit, gamma, brightness, contrast, posterize,
            black_point, white_point, size, levels, dots,
            radius_preset, radius_text, dither, data_mode, script_sampling,
-           reject_radius, reject_hash, bbc_aspect):
+           reject_radius, reject_hash, bbc_aspect,
+           lfsr_x_off, lfsr_y_off, lfsr_tap):
     img = _resolve_image(picker, upload)
     if img is None:
         blank = np.full((256, 256), 255, dtype=np.uint8)
-        return blank, blank, blank, "Pick or upload an image."
+        return blank, blank, blank, blank, "Pick or upload an image."
 
     dark, lum_preview = _preprocess(
         img, fit, gamma, brightness, contrast, posterize, black_point, white_point,
@@ -530,6 +576,27 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
             f"({dither} dither), {dots} R2 iters"
         )
 
+    # --- LFSR side-by-side panel (cell-lookup mode only) ---------------------
+    # The phase diff is what shapes the diagonal-weave pattern; absolute
+    # offsets just translate it. Both are exposed so the user can also nudge
+    # the pattern's position over the image.
+    if data_mode.startswith("cell lookup"):
+        x_off = int(lfsr_x_off) & 0xFFFF
+        y_off = int(lfsr_y_off) & 0xFFFF
+        tap = int(lfsr_tap) & 0xFFFF
+        ink_l, _, plotted_l = _render_bbc_lfsr(
+            cells, size, levels, dots, lut, x_off, y_off, tap)
+        lfsr_img = np.where(ink_l, 0, 255).astype(np.uint8)
+        phase_diff = (x_off - y_off) % 65535
+        lfsr_descr = (
+            f"  \n**LFSR placement**: tap 0x{tap:04X}, "
+            f"x_off={x_off}, y_off={y_off} (phase diff {phase_diff}); "
+            f"{plotted_l} dots plotted"
+        )
+    else:
+        lfsr_img = np.full((256, 320), 255, dtype=np.uint8)
+        lfsr_descr = "  \n*(LFSR placement only previewed in cell-lookup mode.)*"
+
     total = code_est + raw_bytes
     over = total - 256
 
@@ -545,15 +612,17 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
         f"**Radius histogram**: {hist}  \n"
         f"**Byte budget**: code≈{code_est} + data={raw_bytes} = **{total}** "
         f"({'OK, ' + str(256 - total) + ' B spare' if over <= 0 else 'OVER by ' + str(over) + ' B'})"
+        f"{lfsr_descr}"
     )
-    return lum_preview, cells_img, stipple_img, info
+    return lum_preview, cells_img, stipple_img, lfsr_img, info
 
 
 def reset_defaults():
     return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 2048,
             "odd (current BBC: 0,1,3,5)", "0,1,3,5", "none",
             "cell lookup (16×16 grid)", "bilinear",
-            2, "pseudo (xa^ya mod L)", True)
+            2, "pseudo (xa^ya mod L)", True,
+            58372, 12530, 0xB400)
 
 
 def apply_preset(name, current_text, levels):
@@ -659,22 +728,44 @@ def build_ui():
                           "'LFSR' = better-distributed pseudo-random (~+6 bytes asm). "
                           "'uniform' = numpy RNG, ideal-quality reference (cannot be implemented in asm)."),
                 )
+                gr.Markdown(
+                    "### LFSR placement (alternative to R2)  \n"
+                    "Renders simultaneously alongside R2 in the right-hand preview. "
+                    "Two phase offsets into a 65535-long Galois LFSR cycle — the "
+                    "phase **difference** is what shapes the diagonal-weave pattern; "
+                    "absolute offsets just translate it. (Cell-lookup mode only.)"
+                )
+                lfsr_x_off = gr.Slider(
+                    0, 65534, value=58372, step=1, label="x offset")
+                lfsr_y_off = gr.Slider(
+                    0, 65534, value=12530, step=1, label="y offset")
+                lfsr_tap = gr.Number(
+                    value=0xB400, label="tap mask (16-bit)",
+                    info=("0xB400 = high-byte-only tap (cheapest 6502). "
+                          "Other max-length 16-bit taps: 0xD008, 0x8016, 0xA801 — "
+                          "different weave orientations."),
+                    precision=0,
+                )
                 reset_btn = gr.Button("Reset defaults")
             with gr.Column(scale=2):
                 with gr.Row():
                     lum_out = gr.Image(label="preprocessed luminance (320×256 BBC aspect / 256×256 square)",
-                                       height=300, image_mode="L")
+                                       height=260, image_mode="L")
                     cells_out = gr.Image(label="stored cells, upscaled (what BBC sees)",
-                                         height=300, image_mode="L")
-                stipple_out = gr.Image(label="R2 stipple output (320×256, BBC orientation, gx*5 stretch)",
-                                       height=520, image_mode="L")
+                                         height=260, image_mode="L")
+                with gr.Row():
+                    stipple_out = gr.Image(label="R2 placement (current asm)",
+                                           height=420, image_mode="L")
+                    lfsr_out = gr.Image(label="LFSR placement (phase-offset cycle)",
+                                        height=420, image_mode="L")
                 info = gr.Markdown()
 
         controls = [picker, upload, fit, gamma, brightness, contrast, posterize,
                     black_point, white_point, size, levels, dots,
                     radius_preset, radius_text, dither, data_mode, script_sampling,
-                    reject_radius, reject_hash, bbc_aspect]
-        outputs = [lum_out, cells_out, stipple_out, info]
+                    reject_radius, reject_hash, bbc_aspect,
+                    lfsr_x_off, lfsr_y_off, lfsr_tap]
+        outputs = [lum_out, cells_out, stipple_out, lfsr_out, info]
 
         for c in controls:
             if c is radius_preset:
@@ -688,7 +779,8 @@ def build_ui():
             reset_defaults, [],
             [fit, gamma, brightness, contrast, posterize, black_point, white_point,
              size, levels, dots, radius_preset, radius_text, dither, data_mode,
-             script_sampling, reject_radius, reject_hash, bbc_aspect],
+             script_sampling, reject_radius, reject_hash, bbc_aspect,
+             lfsr_x_off, lfsr_y_off, lfsr_tap],
         ).then(render, controls, outputs)
 
         demo.load(render, controls, outputs)
