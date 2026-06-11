@@ -1,5 +1,13 @@
 # Stipple graphics for retro hardware — progress & plan
 
+> **Historical note (2026-06-11):** this document describes the **4 KB MODE 4
+> player** (`bbc/stipple.asm`) — the original target. Active development
+> shifted to the **256-byte MODE 0 intro** (`bbc/stipple256.asm`); see
+> [STIPPLE-256.md](STIPPLE-256.md) and
+> [STIPPLE-256-LFSR.md](STIPPLE-256-LFSR.md). The 4 KB player still assembles
+> but **has not been run on an emulator** — item 1 of the "Next steps" list
+> below remains the open task.
+
 Status as of this session. Goal: turn a photo into an irregular pattern of
 black dots of varying size on a white background, encode the dots as a small,
 well-compressing `(x, y, radius)` list, and plot them on a BBC Micro in MODE 4
@@ -211,16 +219,21 @@ the asm mirrors.
 
 ## 6. Next steps
 
+*(For the 4 KB MODE 4 player only — see header note. The 256-byte intro is
+tracked separately in [STIPPLE-256.md](STIPPLE-256.md).)*
+
 1. **Run it.** Boot `bbc/stipple.ssd` in an emulator (b-em / jsbeeb / BeebEm)
-   and confirm the depack + plot. Most likely bug surface: the ZX02 port's
-   X-register pointer-selector trick, and the signed `dx` 16-bit add.
-2. **Per-image tuning pass** in `stipple.py` for the chosen photo(s).
+   and confirm the depack + plot. **Still open.** Most likely bug surface:
+   the ZX02 port's X-register pointer-selector trick, and the signed `dx`
+   16-bit add.
+2. **Per-image tuning pass** in `stipple.py` for the chosen photo(s). Open.
 3. **Squeeze data** if needed: the lever is dot count (and slightly,
    delta-Y instead of absolute Y). ZX02 won't add much over the delta stream.
 4. Possible polish: progressive plot (largest dots first), a fade-in, multiple
-   images, or a MODE 0 (640×256) variant for finer dots.
+   images, or a MODE 0 (640×256) variant for finer dots. ✅ A MODE 0 variant
+   exists — but as the 256-byte sister project, not as a feature of this player.
 5. Decide whether to also keep a `--posterize`-driven "poster" style as an
-   alternate look.
+   alternate look. Open.
 
 ## File manifest (added this session)
 

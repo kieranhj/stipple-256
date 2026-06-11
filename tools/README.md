@@ -82,8 +82,25 @@ The radius formula degrades gracefully across `--density-exponent`: at 0 the
 cells are equal-area so radius ∝ √darkness (size-led); raise it and cells
 shrink in shadows so radius trends constant (density-led / classic stipple).
 
+## `--mode256` (256-byte intro source generator)
+
+`stipple.py --mode256 <img>` produces the 64-byte 16×16 @ 2bpp source that
+`bbc/stipple256.asm` reads via INCBIN, plus a preview PNG of how it'll look
+on-device. Knobs: `--mode256-size N`, `--mode256-levels L`, `--mode256-dots N`.
+End-to-end (convert + assemble + size report) lives in `bbc/build_256.sh`.
+
+`stipple_ui.py` is a Gradio app for interactive tuning of radius mappings,
+dither, dot-script-vs-cell-lookup data modes, and BBC aspect / `gx*5` stretch
+preview. Run with `python tools/stipple_ui.py`.
+
+See [`docs/STIPPLE-256.md`](../docs/STIPPLE-256.md) for the 256-byte design
+notes and [`docs/STIPPLE-256-LFSR.md`](../docs/STIPPLE-256-LFSR.md) for the
+LFSR-vs-R2 brute-force investigation.
+
 ## Status
 
-Phase 1 (this tool) is functional. Next: lock the binary data format
-(radius buckets, scanline-delta) and validate compressed size, then write the
-retro plot code + depacker for the target machine.
+- **4 KB MODE 4 player tooling** (this script + `verify_bbc.py`) — functional;
+  data format locked; 6502 player assembles but is unverified on emulator
+  (see `docs/STIPPLE.md`).
+- **256-byte MODE 0 intro tooling** (`--mode256`, `stipple_ui.py`,
+  `lfsr_brute.py`) — shipped; 6502 intro verified on jsbeeb at 251/256 bytes.

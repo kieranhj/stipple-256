@@ -330,36 +330,23 @@ buys nothing.
 
 In priority order:
 
-1. **Bump the asm iter count.** `stipple256.asm` sets `cnt = $0300` (768).
-   Try `$0600` (1536) or `$0800` (2048). At 4 cycles emitted per dot via
-   OSWRCH (× ~250 µs each) 2048 dots is ~0.5 s — slow but the title screen
-   is fine to take longer to draw. No data-byte change required, no R2-
-   replacement required.
+1. ✅ **Done.** `stipple256.asm` now sets `cnt = $0800` (2048). Wall-clock is
+   ~30 s per the build-time advisory; visually a big improvement over 768.
 
-2. **If the iter bump still looks "row-banded"** in the emulator, that's
-   not an R2 vs LFSR problem — it's the radius levels at 16×16 producing
-   visible step transitions. Try Floyd-Steinberg pre-dithering the 4-level
-   cell quantisation in `stipple.py` (small change in `downsample_posterize`,
-   no asm change at all). Cheap to try.
+2. ✅ **Tooling done.** Floyd-Steinberg pre-dithering is available in
+   `tools/stipple_ui.py` for tuning the 4-level cell quantisation; per-image
+   hand-tuning still open as needed.
 
-3. **Don't port the LFSR.** Even the best image-specific seed pair gave a
-   visually-worse result than current R2 — see the per-image `_compare.png`
-   files in `out_lfsr/`. The LFSR's "best" output looks like vertical-banded
-   pseudo-random clumping; R2's worst output looks like a halftone print.
+3. ✅ **LFSR not ported.** Confirmed — R2 stays.
 
-4. **Do investigate 32×1 r=4 mode anyway**, but with R2 placement, not
-   LFSR. The `face_32x1_n2048_r4_compare_2x.png` shows a chunky-graphic
-   alternative aesthetic — *visually* different from the current halftone
-   look, even if the MSE is worse. Could be cool for a logo/silhouette
-   intro where graphic punch matters more than tonal fidelity.
+4. **Open.** 32×1 r=4 mode with R2 placement still untried in asm. The
+   chunky-graphic look is interesting but needs ~128 B of data (vs current
+   64 B) which would push code past budget; would need extra byte savings
+   first (none currently in reach).
 
-5. **One residual brute-force idea, unexplored:** the LFSR-wins cluster
-   suggests there's some structure in seed space — most refined seeds
-   landed near `x ≈ y` (cross-diagonal). A targeted brute force constraining
-   `y_seed = x_seed + d` for `d ∈ {0..255}` would explore that subspace
-   exhaustively in seconds and confirm whether close-offset pairs really
-   do dominate. Not done because the metric gap to R2 was too big to make
-   it worth chasing further.
+5. **Open.** Targeted `y_seed = x_seed + d` brute force not run. Even if it
+   found a marginally better seed it wouldn't change recommendation (3), so
+   low priority.
 
 ---
 
