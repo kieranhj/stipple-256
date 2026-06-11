@@ -154,12 +154,12 @@ that meaningfully beats R2 within the chosen metric.**
 
 | image | mode | iters | r | LFSR x | LFSR y | LFSR MSE | R2 MSE | Δ vs R2 | search time |
 |-------|------|------:|--:|-------:|-------:|---------:|-------:|---------|------------:|
-| mona_list_square | 16x2 | 1024 | — | 34960 | 14452 | 0.109627 | 0.073071 | -50.0 % | 75 s |
-| mona_list_square | 16x2 | 2048 | — | 34164 | 34175 | 0.084326 | 0.081952 | -2.9 % | 165 s |
-| mona_list_square | 32x1 | 1024 | 3 |  7726 | 52834 | 0.223242 | 0.197379 | -13.1 % | 34 s |
-| mona_list_square | 32x1 | 1024 | 4 | 19089 | 24999 | 0.160763 | 0.125136 | -28.5 % | 40 s |
-| mona_list_square | 32x1 | 2048 | 3 | 15037 |  7905 | 0.143534 | 0.148083 | **+3.1 %** | 65 s |
-| mona_list_square | 32x1 | 2048 | 4 | 50668 |  2575 | 0.115478 | 0.113671 | -1.6 % | 164 s |
+| mona_lisa_square | 16x2 | 1024 | — | 34960 | 14452 | 0.109627 | 0.073071 | -50.0 % | 75 s |
+| mona_lisa_square | 16x2 | 2048 | — | 34164 | 34175 | 0.084326 | 0.081952 | -2.9 % | 165 s |
+| mona_lisa_square | 32x1 | 1024 | 3 |  7726 | 52834 | 0.223242 | 0.197379 | -13.1 % | 34 s |
+| mona_lisa_square | 32x1 | 1024 | 4 | 19089 | 24999 | 0.160763 | 0.125136 | -28.5 % | 40 s |
+| mona_lisa_square | 32x1 | 2048 | 3 | 15037 |  7905 | 0.143534 | 0.148083 | **+3.1 %** | 65 s |
+| mona_lisa_square | 32x1 | 2048 | 4 | 50668 |  2575 | 0.115478 | 0.113671 | -1.6 % | 164 s |
 | face | 16x2 | 1024 | — | 16655 | 65497 | 0.074086 | 0.041772 | -77.4 % | 139 s |
 | face | 16x2 | 2048 | — |  6589 | 24690 | 0.048966 | 0.047017 | -4.1 % | 347 s |
 | face | 32x1 | 1024 | 3 | 57104 | 61665 | 0.290960 | 0.239492 | -21.5 % | 65 s |
@@ -361,7 +361,7 @@ In priority order:
 To reproduce a single run:
 
 ```
-python tools/lfsr_brute.py --image pics/mona_list_square.png \
+python tools/lfsr_brute.py --image pics/mona_lisa_square.png \
     --mode 16x2 --iters 1024 --random 300000 --refine-top 3
 ```
 

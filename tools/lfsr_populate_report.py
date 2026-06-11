@@ -53,7 +53,7 @@ for r in results:
 print("\n### Per-image best (16x2 mode, 1024 iters)\n")
 print("| image | LFSR x_seed | LFSR y_seed | LFSR MSE | R2 MSE | Δ |")
 print("|-------|------------:|------------:|---------:|-------:|---|")
-for img in ["mona_list_square", "face", "eye"]:
+for img in ["mona_lisa_square", "face", "eye"]:
     r = by(img, "16x2", 1024)
     if r is None:
         continue
@@ -65,7 +65,7 @@ for img in ["mona_list_square", "face", "eye"]:
 print("\n### Mode comparison @ 1024 iters per image (LFSR MSE / R2 MSE)\n")
 print("| image | 16x2 LFSR | 16x2 R2 | 32x1 r=3 LFSR | 32x1 r=3 R2 | 32x1 r=4 LFSR | 32x1 r=4 R2 |")
 print("|-------|----------:|--------:|--------------:|------------:|--------------:|------------:|")
-for img in ["mona_list_square", "face", "eye"]:
+for img in ["mona_lisa_square", "face", "eye"]:
     row = [img]
     for mode, fr in [("16x2", None), ("32x1", 3), ("32x1", 4)]:
         r = by(img, mode, 1024, fr)
@@ -78,7 +78,7 @@ for img in ["mona_list_square", "face", "eye"]:
 print("\n### Mode comparison @ 2048 iters per image\n")
 print("| image | 16x2 LFSR | 16x2 R2 | 32x1 r=3 LFSR | 32x1 r=3 R2 | 32x1 r=4 LFSR | 32x1 r=4 R2 |")
 print("|-------|----------:|--------:|--------------:|------------:|--------------:|------------:|")
-for img in ["mona_list_square", "face", "eye"]:
+for img in ["mona_lisa_square", "face", "eye"]:
     row = [img]
     for mode, fr in [("16x2", None), ("32x1", 3), ("32x1", 4)]:
         r = by(img, mode, 2048, fr)

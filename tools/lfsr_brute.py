@@ -34,7 +34,7 @@ Gaussian-blurred MSE (sigma=4 px) of rendered ink vs target tone, both at 256x25
 
 Usage
 -----
-  python tools/lfsr_brute.py --image pics/mona_list_square.png --mode 16x2 \
+  python tools/lfsr_brute.py --image pics/mona_lisa_square.png --mode 16x2 \
       --iters 1024 --random 200000 --refine 3 --out out_lfsr/
   python tools/lfsr_brute.py --runall              # all images x modes x iters
 
@@ -661,7 +661,7 @@ def main():
 
     if args.runall:
         images = [
-            "pics/mona_list_square.png",
+            "pics/mona_lisa_square.png",
             "pics/face.png",
             "pics/eye.png",
         ]
