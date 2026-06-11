@@ -48,10 +48,11 @@ GUARD &7C00
     ; so its stx-stash above survives the loop. Saves ~3 B vs a separate
     ; zerolp loop.
     ldx #vdulen-1
-    stx cnt_hi                       ; 16-bit iter counter = vdulen-1 in hi byte.
-                                     ; With current vdutab (14 bytes incl. VDU 29
-                                     ; origin centring), vdulen-1 = 13, so the
-                                     ; counter starts at $0D00 = 3328 iters.
+    lda #8 : sta cnt_hi              ; 16-bit iter counter = $0800 = 2048 iters.
+                                     ; vdulen-1 = 13 happens to be in X here,
+                                     ; but 13 (3328 iters) looks blowny — 2048
+                                     ; reads better, so explicit init wins.
+                                     ; Cost: 4 B vs 2 B for `stx cnt_hi`.
     ldy #0
 .vinit
     lda vdutab,x
@@ -102,10 +103,10 @@ GUARD &7C00
                                      ; emit6 both preserve X).
 
     ; --- gx = px*4 -> buf+3 (lo), buf+2 (hi) (reversed layout)
-    ; Picture sits left-aligned on screen (no horizontal stretch). Spans
-    ; 0..1020 logical units of MODE 0's 1280 width — i.e. left 80% of screen,
-    ; right ~260 units empty. Centring would cost ~11 B back (see commit log);
-    ; we're spending the saved bytes elsewhere.
+    ; Picture spans 0..1020 logical units in gx (px=0..255). MOS adds the
+    ; VDU 29 origin (+130, 0) to every PLOT/MOVE coord, so the picture
+    ; actually lands at 130..1150 on the 1280-wide MODE 0 screen — centred
+    ; with ~130 units of margin on each side.
     lda xa+1
     asl A
     sta buf+3
