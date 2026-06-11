@@ -1,0 +1,16 @@
+# python
+__pycache__/
+*.pyc
+
+# stipple build outputs
+stipple_out/
+out_*/
+bbc/data/.build_tmp/
+
+# tooling binary (download separately)
+tools/beebasm.exe
+
+# editor / IDE
+/.vscode/
+/.vs/
+/.claude/
