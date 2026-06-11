@@ -138,7 +138,7 @@ ink still roughly tracks tone because more+bigger dots land in dark regions.
    estimate, emits the tiny source bytes. Also exposed via `tools/stipple_ui.py`
    (Gradio).
 2. ✅ Downsample / posterize / dot-count tuning done across the test images.
-   `mona_lisa_square` chosen as default subject.
+   `mona_lisa_crop` chosen as default subject.
 3. ✅ `bbc/stipple256.asm` written, assembled with BeebAsm, verified on jsbeeb
    Master.
 4. ✅ PLOT codes confirmed: **`157`** (not 153) for absolute-foreground filled
@@ -147,7 +147,7 @@ ink still roughly tracks tone because more+bigger dots land in dark regions.
 ## Open questions for the morning
 
 - **Option 1 (procedural) vs 2 (tiny photo)?** → **Option 2** chosen and shipped.
-- **Subject?** → `mona_lisa_square` (cropped Mona Lisa) is the default;
+- **Subject?** → `mona_lisa_crop` (cropped Mona Lisa) is the default;
   `monarch` and `mandarin-duck-1` also read well at 16×16.
 - **Placement: R2 vs LFSR?** → **R2** confirmed (see
   [STIPPLE-256-LFSR.md](STIPPLE-256-LFSR.md) — brute-forced LFSR seeds did not
@@ -256,7 +256,7 @@ End-to-end via `bbc/build_256.sh` (converts image + assembles + size report):
 
 ```
 cd bbc
-./build_256.sh                                  # default: pics/mona_lisa_square.png
+./build_256.sh                                  # default: pics/mona_lisa_crop.png
 ./build_256.sh face.png                         # use pics/face.png
 ./build_256.sh face.png --mode256-levels 8      # extra args pass through to stipple.py
 ./build_256.sh --run                            # also open the resulting .ssd

@@ -28,7 +28,7 @@ The 256-byte intro:
 
 ```sh
 cd bbc
-./build_256.sh                          # default image: pics/mona_lisa_square.png
+./build_256.sh                          # default image: pics/mona_lisa_crop.png
 ./build_256.sh face.png                 # use pics/face.png
 ./build_256.sh face.png --mode256-size 16 --mode256-levels 4
 ./build_256.sh --run                    # also open the resulting .ssd

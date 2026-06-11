@@ -5,7 +5,7 @@
 # Run from anywhere; the script cd's to its own directory (bbc/).
 #
 # Usage:
-#   ./build_256.sh                                       convert pics/mona_lisa_square.png, assemble
+#   ./build_256.sh                                       convert pics/mona_lisa_crop.png, assemble
 #   ./build_256.sh <image>                               convert <image>, assemble
 #                                                        (absolute, repo-relative, or pics/<name>)
 #   ./build_256.sh --run                                 default image, assemble, open .ssd
@@ -43,7 +43,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-IMG="${IMG:-$REPO/pics/mona_lisa_square.png}"
+IMG="${IMG:-$REPO/pics/mona_lisa_crop.png}"
 
 # resolve image path: absolute, then repo-relative, then pics/-relative
 if [ ! -f "$IMG" ]; then
