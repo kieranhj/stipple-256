@@ -38,6 +38,15 @@ GUARD &7C00
 .start
     ; --- VDU init, sent in reverse via dex/bpl (saves 2 bytes vs forward) ---
     ldx #vdulen-1
+    stx cnt_hi                       ; 16-bit iter counter = vdulen-1 in hi byte.
+                                     ; With current vdutab (14 bytes incl. VDU 29
+                                     ; origin centring), vdulen-1 = 13, so the
+                                     ; counter starts at $0D00 = 3328 iters.
+                                     ; Stashing X here is free (2 B); the
+                                     ; alternative `lda # / sta cnt_hi` is 4 B.
+                                     ; Iter count is whatever vdulen-1 happens
+                                     ; to be — if you ever want to lock it to
+                                     ; a specific value, add explicit init here.
 .vinit
     lda vdutab,x
     jsr oswrch
@@ -53,9 +62,6 @@ GUARD &7C00
     bpl zerolp
 
     lda #25 : sta buf+5              ; emitted first (Y=5)
-
-    lda #8
-    sta cnt_hi                       ; 16-bit counter = $0800 = 2048 iters
 
 .loop
     ; --- R2 --- (ya first so A = xa+1 falls through into the cell lookup)
@@ -96,9 +102,11 @@ GUARD &7C00
                                      ; r lives in X across emit6 (OSWRCH and
                                      ; emit6 both preserve X).
 
-    ; --- gx = px*5 -> buf+3 (lo), buf+2 (hi) (reversed layout)
-    ; px*5 = px*4 + px. Stretches the dot field from 256 px wide to ~318 px
-    ; wide so it fills MODE 4's 320 px width instead of leaving a right gap.
+    ; --- gx = px*4 -> buf+3 (lo), buf+2 (hi) (reversed layout)
+    ; Picture sits left-aligned on screen (no horizontal stretch). Spans
+    ; 0..1020 logical units of MODE 0's 1280 width — i.e. left 80% of screen,
+    ; right ~260 units empty. Centring would cost ~11 B back (see commit log);
+    ; we're spending the saved bytes elsewhere.
     lda xa+1
     asl A
     sta buf+3
@@ -106,11 +114,6 @@ GUARD &7C00
     rol A
     sta buf+2
     asl buf+3 : rol buf+2            ; buf+3:buf+2 = px*4
-    clc
-    lda buf+3 : adc xa+1 : sta buf+3 ; += px (low byte)
-    bcc gx_no_carry
-    inc buf+2                         ; propagate the carry into hi
-.gx_no_carry
 
     ; --- gy = py*4 -> buf+1 (lo), buf+0 (hi) ---
     lda ya+1
@@ -145,10 +148,12 @@ GUARD &7C00
                                      ; branches to itself = infinite loop;
                                      ; otherwise Z=0 falls through.
 .not_yet
-    jmp loop                         ; back-edge to .loop; was `bne loop` when
-                                     ; the loop body was small enough to reach
-                                     ; it in a -128 branch, but gx*5 grew the
-                                     ; body past the branch limit.
+    bne loop                         ; back-edge to .loop. Z=0 here in both
+                                     ; paths (bne not_yet taken with Z=0;
+                                     ; or .hang fell through with Z=0), so
+                                     ; bne is unconditional in practice.
+                                     ; Reach: offset exactly -128 -- the
+                                     ; loop body is sized to the millimetre.
 
 .emit6
     ldy #5                           ; emit buf[5], buf[4], ..., buf[0]
@@ -161,20 +166,25 @@ GUARD &7C00
 
 ; --- VDU init ---
 ; bytes stored in REVERSE; init loop reads them with X decreasing so they
-; reach OSWRCH in the intended order: 22,4, 17,129, 12, 18,0,0
-;   22,4    MODE 4
-;   17,129  text bg = logical 1 (white)
-;   12      CLS
-;   18,0,0  GCOL 0,0 (plot logical 0 = black)
+; reach OSWRCH in the intended order:
+;   22, 0           MODE 0  (640x256 1bpp; 5:4 logical aspect comp by MOS)
+;   17, 129         COLOUR 129 (text bg = logical 1 = white)
+;   12              CLS  (clears to background = white)
+;   5               VDU 5 (text at graphics cursor — hides flashing cursor).
+;                   MUST come after CLS, else CLS sees text-in-graphics-mode
+;                   and behaves differently.
+;   18, 0, 0        GCOL 0, 0 (plot logical 0 = black)
+;   29, 130, 0, 0, 0  Move origin: shifts all PLOT/MOVE coords by (+130, +0)
+;                   to centre the gx*4 picture in the 1280-wide MODE 0 screen.
+;                   Image spans logical 0..1020 in x; with origin 130 it lands
+;                   at 130..1150 — ~130 units left and right margin.
 .vdutab
-    EQUB 0, 0, 18                    ; GCOL 0,0 (read last)
-    EQUB 5                           ; VDU 5 (text at graphics cursor -> hides
-                                     ; the flashing text cursor). MUST come
-                                     ; after CLS, otherwise CLS sees text-emit-
-                                     ; goes-to-graphics and behaves differently.
-    EQUB 12                          ; CLS (clears text window to bg = white)
-    EQUB 129, 17                     ; COLOUR 129 (text bg = logical 1 = white)
-    EQUB 0, 22                       ; MODE 4 (read first)
+    EQUB 0, 0, 0, 130, 29            ; VDU 29 — set origin (130, 0). Read last.
+    EQUB 0, 0, 18                    ; GCOL 0, 0
+    EQUB 5                           ; VDU 5
+    EQUB 12                          ; CLS
+    EQUB 129, 17                     ; COLOUR 129
+    EQUB 0, 22                       ; MODE 0 (read first)
 vdulen = * - vdutab
 
 .image
