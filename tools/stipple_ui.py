@@ -63,6 +63,25 @@ def build_lfsr_cycle(tap=LFSR_TAP_DEFAULT):
 _LFSR_CYCLE_CACHE: dict[int, np.ndarray] = {}
 
 
+def _parse_tap(s):
+    """Accept '0xB400', 'B400', '46080' (decimal), or a numeric value."""
+    if isinstance(s, (int, float)):
+        return int(s)
+    s = str(s).strip()
+    if not s:
+        return LFSR_TAP_DEFAULT
+    try:
+        if s.lower().startswith("0x"):
+            return int(s, 16)
+        # If it has any a-f digits, treat as hex without prefix (e.g. "B400").
+        if any(c in s.lower() for c in "abcdef"):
+            return int(s, 16)
+        # Plain digits only — treat as decimal.
+        return int(s)
+    except ValueError:
+        return LFSR_TAP_DEFAULT
+
+
 def lfsr_sequence(n, x_off, y_off, tap=LFSR_TAP_DEFAULT):
     """One shared LFSR hi-byte cycle read at two phase offsets."""
     if tap not in _LFSR_CYCLE_CACHE:
@@ -131,14 +150,12 @@ def _resolve_image(picker_value, upload_pil):
 
 
 def _preprocess(img, fit, gamma, brightness, contrast, posterize,
-                black_point, white_point, bbc_aspect=True):
+                black_point, white_point):
     """Run stipple.load_darkness equivalent on a PIL.Image; return (dark, lum_preview).
 
-    bbc_aspect=True fits to 320x256 (the BBC's physical 5:4 screen aspect,
-    same in MODE 0 and MODE 4 — MOS VDU units are resolution-independent)
-    so that when the asm renders with gx*5 the on-screen image looks
-    proportional. bbc_aspect=False keeps the legacy 256x256 square fit
-    (image appears stretched 25% wider on the BBC).
+    Source is fit to 256x256 (square): the asm uses gx*4 so the picture spans
+    1024 logical units of x and 1024 logical units of y — i.e. a square area
+    on the BBC screen, left-aligned (no horizontal stretch / no centring).
     """
     opts = SimpleNamespace(
         gamma=float(gamma),
@@ -154,8 +171,7 @@ def _preprocess(img, fit, gamma, brightness, contrast, posterize,
         bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
         img = Image.alpha_composite(bg, img)
     img = img.convert("L")
-    W, H = (320, 256) if bbc_aspect else (256, 256)
-    img = st._fit(img, W, H, fit)
+    img = st._fit(img, 256, 256, fit)
     lum = np.asarray(img, dtype=np.float64) / 255.0
 
     lo, hi = opts.black_point, opts.white_point
@@ -313,14 +329,11 @@ def _render_bbc_from_seq(cells, size, levels, xs, ys, radius_lut):
     preview's streak direction match the emulator while keeping the image
     itself right-side up (we sample and stamp at the same mirrored y).
 
-    Model the BBC asm's gx*5 screen-fill at MODE 4 resolution (320x256).
-    The asm now targets MODE 0 (640x256 pixel grid) but MOS VDU units are
-    resolution-independent: PLOT 157 produces a physically round dot at
-    the same physical size in either mode, and the screen aspect stays
-    5:4. MODE 0 just gives finer pixel granularity along the dot edges
-    (smoother circles on hardware). Previewing at 320x256 is a faithful
-    physical-aspect view — the smoother-edge benefit only shows on
-    actual hardware / jsbeeb.
+    Centring: the asm now emits VDU 29, 130, 0, 0, 0 so all PLOT/MOVE coords
+    are shifted by +130 logical units in x. In preview units (1 preview px
+    = 4 logical units, since 320-wide preview maps to MODE 0's 1280-logical-
+    wide screen) that's 130/4 ≈ 32 preview pixels — picture lands at preview
+    x = 32..287 instead of 0..255.
     """
     darkness_grid = (levels - 1) - cells       # 0=light, levels-1=dark
     ys = (255 - ys.astype(np.int32)).astype(np.uint8)
@@ -329,7 +342,7 @@ def _render_bbc_from_seq(cells, size, levels, xs, ys, radius_lut):
     cell_vals = darkness_grid[iy, ix]
     lut = np.asarray(radius_lut, dtype=np.int32)
     radii = lut[np.clip(cell_vals, 0, len(lut) - 1)]
-    gx_pixels = (xs.astype(np.int32) * 5) // 4
+    gx_pixels = xs.astype(np.int32) + 32       # VDU 29 origin shift (preview px)
     ink, plotted = _stamp_dots(gx_pixels, ys, radii, W=320, H=256)
     return ink, radii, plotted
 
@@ -501,7 +514,7 @@ def _render_rejection(dark, size, levels, n_iters, fixed_r, hash_mode):
 def render(picker, upload, fit, gamma, brightness, contrast, posterize,
            black_point, white_point, size, levels, dots,
            radius_preset, radius_text, dither, data_mode, script_sampling,
-           reject_radius, reject_hash, bbc_aspect,
+           reject_radius, reject_hash,
            lfsr_x_off, lfsr_y_off, lfsr_tap):
     img = _resolve_image(picker, upload)
     if img is None:
@@ -509,15 +522,14 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
         return blank, blank, blank, blank, "Pick or upload an image."
 
     dark, lum_preview = _preprocess(
-        img, fit, gamma, brightness, contrast, posterize, black_point, white_point,
-        bbc_aspect=bool(bbc_aspect))
+        img, fit, gamma, brightness, contrast, posterize, black_point, white_point)
 
     size = int(size)
     levels = int(levels)
     dots = int(dots)
     bits_per = max(1, int(np.ceil(np.log2(levels))))
     lut = _parse_lut(radius_text, levels)
-    code_est = 191  # current asm reality (see docs/STIPPLE-256.md)
+    code_est = 178  # current asm reality (see docs/STIPPLE-256.md)
     data_budget = 64  # bytes the data section currently has room for
 
     if data_mode.startswith("rejection"):
@@ -583,7 +595,7 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
     if data_mode.startswith("cell lookup"):
         x_off = int(lfsr_x_off) & 0xFFFF
         y_off = int(lfsr_y_off) & 0xFFFF
-        tap = int(lfsr_tap) & 0xFFFF
+        tap = _parse_tap(lfsr_tap) & 0xFFFF
         ink_l, _, plotted_l = _render_bbc_lfsr(
             cells, size, levels, dots, lut, x_off, y_off, tap)
         lfsr_img = np.where(ink_l, 0, 255).astype(np.uint8)
@@ -621,8 +633,8 @@ def reset_defaults():
     return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 2048,
             "odd (current BBC: 0,1,3,5)", "0,1,3,5", "none",
             "cell lookup (16×16 grid)", "bilinear",
-            2, "pseudo (xa^ya mod L)", True,
-            58372, 12530, 0xB400)
+            2, "pseudo (xa^ya mod L)",
+            58372, 12530, "0xB400")
 
 
 def apply_preset(name, current_text, levels):
@@ -655,14 +667,6 @@ def build_ui():
                 upload = gr.Image(type="pil", label="...or upload (overrides picker)",
                                   height=200)
                 fit = gr.Radio(["cover", "contain"], value="cover", label="fit")
-                bbc_aspect = gr.Checkbox(
-                    value=True,
-                    label="BBC aspect (5:4 fit, compensates gx*5 stretch)",
-                    info=("ON: source is fit to 320x256 (BBC physical screen "
-                          "aspect, same in MODE 0 and MODE 4) so the on-screen "
-                          "image looks proportional. OFF: 256x256 square fit "
-                          "— image appears stretched 25% wider on the BBC."),
-                )
                 gr.Markdown("### Preprocessing")
                 gamma = gr.Slider(0.2, 4.0, value=1.0, step=0.05, label="gamma (>1 lightens midtones)")
                 brightness = gr.Slider(-0.5, 0.5, value=0.0, step=0.01, label="brightness")
@@ -679,7 +683,7 @@ def build_ui():
                           "32×32=1024 dots = 256 B — exceeds budget but reveals visual ceiling)."),
                 )
                 levels = gr.Slider(2, 8, value=4, step=1, label="levels (4 = 2 bpp)")
-                dots = gr.Slider(64, 2048, value=2048, step=32, label="R2 dot iterations")
+                dots = gr.Slider(64, 16384, value=2048, step=64, label="R2 dot iterations")
                 gr.Markdown("### Radius mapping (cell darkness → pixel radius)")
                 radius_preset = gr.Radio(
                     list(RADIUS_PRESETS.keys()),
@@ -696,25 +700,6 @@ def build_ui():
                     DITHER_MODES, value="none", label="dither mode",
                     info="F-S diffuses quantisation error; ordered adds a Bayer threshold pattern.",
                 )
-                gr.Markdown("### Data interpretation (Option 2 toggle)")
-                data_mode = gr.Radio(
-                    DATA_MODES, value="cell lookup (16×16 grid)",
-                    label="how the 64 B of source data is read",
-                    info=("'cell lookup' = current asm: 16×16×{levels} grid sampled per dot. "
-                          "'dot script' = data is a sequence of per-iteration radii "
-                          "(256 dots × 2 bits = 64 B at L=4). One sample per dot — "
-                          "more detail at edges, fewer dots total."),
-                )
-                script_sampling = gr.Radio(
-                    ["nearest", "bilinear"], value="bilinear",
-                    label="dot-script sampling (Option 2 only)",
-                    info=("'nearest' = sample dark map at the dot's integer pixel "
-                          "position only. 'bilinear' = use the R2 sub-pixel position "
-                          "(the low byte of the 16-bit R2 accumulators that the asm "
-                          "currently throws away) to blend the 4 surrounding pixels. "
-                          "Free on-device — the BBC still plots at the same integer "
-                          "position; bilinear only changes the offline-baked radius."),
-                )
                 gr.Markdown("### Rejection sampling (Option 1 only)")
                 reject_radius = gr.Slider(
                     1, 4, value=2, step=1,
@@ -728,28 +713,10 @@ def build_ui():
                           "'LFSR' = better-distributed pseudo-random (~+6 bytes asm). "
                           "'uniform' = numpy RNG, ideal-quality reference (cannot be implemented in asm)."),
                 )
-                gr.Markdown(
-                    "### LFSR placement (alternative to R2)  \n"
-                    "Renders simultaneously alongside R2 in the right-hand preview. "
-                    "Two phase offsets into a 65535-long Galois LFSR cycle — the "
-                    "phase **difference** is what shapes the diagonal-weave pattern; "
-                    "absolute offsets just translate it. (Cell-lookup mode only.)"
-                )
-                lfsr_x_off = gr.Slider(
-                    0, 65534, value=58372, step=1, label="x offset")
-                lfsr_y_off = gr.Slider(
-                    0, 65534, value=12530, step=1, label="y offset")
-                lfsr_tap = gr.Number(
-                    value=0xB400, label="tap mask (16-bit)",
-                    info=("0xB400 = high-byte-only tap (cheapest 6502). "
-                          "Other max-length 16-bit taps: 0xD008, 0x8016, 0xA801 — "
-                          "different weave orientations."),
-                    precision=0,
-                )
                 reset_btn = gr.Button("Reset defaults")
             with gr.Column(scale=2):
                 with gr.Row():
-                    lum_out = gr.Image(label="preprocessed luminance (320×256 BBC aspect / 256×256 square)",
+                    lum_out = gr.Image(label="preprocessed luminance (256×256 square)",
                                        height=260, image_mode="L")
                     cells_out = gr.Image(label="stored cells, upscaled (what BBC sees)",
                                          height=260, image_mode="L")
@@ -758,12 +725,52 @@ def build_ui():
                                            height=420, image_mode="L")
                     lfsr_out = gr.Image(label="LFSR placement (phase-offset cycle)",
                                         height=420, image_mode="L")
+                # --- below-preview controls: data interpretation + LFSR ----
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("### Data interpretation (Option 2 toggle)")
+                        data_mode = gr.Radio(
+                            DATA_MODES, value="cell lookup (16×16 grid)",
+                            label="how the 64 B of source data is read",
+                            info=("'cell lookup' = current asm: 16×16×{levels} grid sampled per dot. "
+                                  "'dot script' = data is a sequence of per-iteration radii "
+                                  "(256 dots × 2 bits = 64 B at L=4). One sample per dot — "
+                                  "more detail at edges, fewer dots total."),
+                        )
+                        script_sampling = gr.Radio(
+                            ["nearest", "bilinear"], value="bilinear",
+                            label="dot-script sampling (Option 2 only)",
+                            info=("'nearest' = sample dark map at the dot's integer pixel "
+                                  "position only. 'bilinear' = use the R2 sub-pixel position "
+                                  "(the low byte of the 16-bit R2 accumulators that the asm "
+                                  "currently throws away) to blend the 4 surrounding pixels. "
+                                  "Free on-device — the BBC still plots at the same integer "
+                                  "position; bilinear only changes the offline-baked radius."),
+                        )
+                    with gr.Column():
+                        gr.Markdown(
+                            "### LFSR placement (alternative to R2)  \n"
+                            "Renders simultaneously alongside R2 in the right-hand preview. "
+                            "Two phase offsets into a 65535-long Galois LFSR cycle — the "
+                            "phase **difference** is what shapes the diagonal-weave pattern; "
+                            "absolute offsets just translate it. (Cell-lookup mode only.)"
+                        )
+                        lfsr_x_off = gr.Slider(
+                            0, 65534, value=58372, step=1, label="x offset")
+                        lfsr_y_off = gr.Slider(
+                            0, 65534, value=12530, step=1, label="y offset")
+                        lfsr_tap = gr.Textbox(
+                            value="0xB400", label="tap mask (16-bit hex)",
+                            info=("0xB400 = high-byte-only tap (cheapest 6502). "
+                                  "Other max-length 16-bit taps: 0xD008, 0x8016, 0xA801 — "
+                                  "different weave orientations. Accepts 0xB400, B400, or decimal."),
+                        )
                 info = gr.Markdown()
 
         controls = [picker, upload, fit, gamma, brightness, contrast, posterize,
                     black_point, white_point, size, levels, dots,
                     radius_preset, radius_text, dither, data_mode, script_sampling,
-                    reject_radius, reject_hash, bbc_aspect,
+                    reject_radius, reject_hash,
                     lfsr_x_off, lfsr_y_off, lfsr_tap]
         outputs = [lum_out, cells_out, stipple_out, lfsr_out, info]
 
@@ -779,7 +786,7 @@ def build_ui():
             reset_defaults, [],
             [fit, gamma, brightness, contrast, posterize, black_point, white_point,
              size, levels, dots, radius_preset, radius_text, dither, data_mode,
-             script_sampling, reject_radius, reject_hash, bbc_aspect,
+             script_sampling, reject_radius, reject_hash,
              lfsr_x_off, lfsr_y_off, lfsr_tap],
         ).then(render, controls, outputs)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Side-by-side preview of R2 vs a specific LFSR seed at the as-shipped
-asm pipeline parameters (MODE 0, 320x256 preview, gx*5 stretch, radii
+asm pipeline parameters (MODE 0, 320x256 preview, gx*4 left-aligned, radii
 {0,1,3,5}, 2048 iters, 5:4 aspect-correct preprocess).
 
 The brute force in lfsr_brute.py rendered at the *old* asm pipeline
@@ -90,13 +90,11 @@ def load_darkness(img_path):
 
 
 def load_darkness_5_4(img_path):
-    """Load and fit to 256x256 with 5:4 aspect-correct preprocess.
+    """Square 256x256 fit (current asm: gx*4 left-aligned, no horizontal
+    stretch, no centring — picture is logically square on screen).
 
-    The asm reads cells at integer 16x16 grid positions but plots with gx*5
-    so the on-screen picture spans the full MODE 0 width. To make the dot
-    pattern proportional, we must SQUASH the source horizontally by 4/5
-    before downsampling to 16x16. Equivalent: fit to 320x256 then bin to
-    16x16 (each cell averages 20x16 source pixels, not 16x16).
+    Kept under the historical name so the --legacy path's signature still
+    works; behaviour is now identical to load_darkness().
     """
     img = Image.open(img_path)
     if img.mode in ("RGBA", "LA", "P"):
@@ -105,7 +103,7 @@ def load_darkness_5_4(img_path):
         bg.paste(img, mask=img.split()[-1])
         img = bg
     img = img.convert("L")
-    img = img.resize((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
+    img = img.resize((256, 256), Image.LANCZOS)
     arr = np.asarray(img, dtype=np.float64) / 255.0
     return 1.0 - arr  # darkness
 
@@ -167,7 +165,8 @@ def render(xs, ys, cells):
     if LEGACY[0]:
         # old asm: no gx stretch; render at 256x256 (matches brute force output).
         return stamp(xs, ys_flipped, radii, 256, 256)
-    gx_pixels = (xs.astype(np.int32) * 5) // 4
+    # VDU 29 origin shift (+130 logical = +32 preview pixels at 320-wide canvas)
+    gx_pixels = xs.astype(np.int32) + 32
     return stamp(gx_pixels, ys_flipped, radii, PREVIEW_W, PREVIEW_H)
 
 
