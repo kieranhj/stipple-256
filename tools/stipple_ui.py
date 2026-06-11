@@ -98,10 +98,11 @@ def _preprocess(img, fit, gamma, brightness, contrast, posterize,
                 black_point, white_point, bbc_aspect=True):
     """Run stipple.load_darkness equivalent on a PIL.Image; return (dark, lum_preview).
 
-    bbc_aspect=True fits to 640x256 (MODE 0's 5:2 screen aspect) so that
-    when the asm renders with gx*5 the on-screen image looks proportional.
-    bbc_aspect=False keeps the legacy 256x256 square fit (image appears
-    stretched 2.5x wider on the BBC).
+    bbc_aspect=True fits to 320x256 (the BBC's physical 5:4 screen aspect,
+    same in MODE 0 and MODE 4 — MOS VDU units are resolution-independent)
+    so that when the asm renders with gx*5 the on-screen image looks
+    proportional. bbc_aspect=False keeps the legacy 256x256 square fit
+    (image appears stretched 25% wider on the BBC).
     """
     opts = SimpleNamespace(
         gamma=float(gamma),
@@ -117,7 +118,7 @@ def _preprocess(img, fit, gamma, brightness, contrast, posterize,
         bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
         img = Image.alpha_composite(bg, img)
     img = img.convert("L")
-    W, H = (640, 256) if bbc_aspect else (256, 256)
+    W, H = (320, 256) if bbc_aspect else (256, 256)
     img = st._fit(img, W, H, fit)
     lum = np.asarray(img, dtype=np.float64) / 255.0
 
@@ -155,8 +156,8 @@ def _cells_preview(cells_lum):
 # For levels > 4 we extend the presets with reasonable defaults; the text box
 # is the source of truth.
 RADIUS_PRESETS = {
-    "cell×2 (current BBC: 0,2,4,6)": [0, 2, 4, 6],
-    "odd (0,1,3,5)": [0, 1, 3, 5],
+    "odd (current BBC: 0,1,3,5)": [0, 1, 3, 5],
+    "cell×2 (earlier: 0,2,4,6)": [0, 2, 4, 6],
     "cell (earlier smaller: 0,1,2,3)": [0, 1, 2, 3],
     "wide (0,2,4,7)": [0, 2, 4, 7],
     "binary (0,0,4,4)": [0, 0, 4, 4],
@@ -288,10 +289,16 @@ def _render_bbc(cells, size, levels, dots, radius_lut):
     cell_vals = darkness_grid[iy, ix]
     lut = np.asarray(radius_lut, dtype=np.int32)
     radii = lut[np.clip(cell_vals, 0, len(lut) - 1)]
-    # Model the BBC asm's gx*5 screen-fill in MODE 0 (640x256):
-    # logical gx = px*5 (0..1275), physical pixel = gx/2 (0..637).
-    gx_pixels = (xs.astype(np.int32) * 5) // 2
-    ink, plotted = _stamp_dots(gx_pixels, ys, radii, W=640, H=256)
+    # Model the BBC asm's gx*5 screen-fill at MODE 4 resolution (320x256).
+    # The asm now targets MODE 0 (640x256 pixel grid) but MOS VDU units are
+    # resolution-independent: PLOT 157 produces a physically round dot at
+    # the same physical size in either mode, and the screen aspect stays
+    # 5:4. MODE 0 just gives finer pixel granularity along the dot edges
+    # (smoother circles on hardware). Previewing at 320x256 is a faithful
+    # physical-aspect view — the smoother-edge benefit only shows on
+    # actual hardware / jsbeeb.
+    gx_pixels = (xs.astype(np.int32) * 5) // 4
+    ink, plotted = _stamp_dots(gx_pixels, ys, radii, W=320, H=256)
     return ink, radii, plotted
 
 
@@ -544,7 +551,7 @@ def render(picker, upload, fit, gamma, brightness, contrast, posterize,
 
 def reset_defaults():
     return ("cover", 1.0, 0.0, 1.0, 0, 0.0, 1.0, 16, 4, 2048,
-            "odd (0,1,3,5)", "0,1,3,5", "none",
+            "odd (current BBC: 0,1,3,5)", "0,1,3,5", "none",
             "cell lookup (16×16 grid)", "bilinear",
             2, "pseudo (xa^ya mod L)", True)
 
@@ -581,11 +588,11 @@ def build_ui():
                 fit = gr.Radio(["cover", "contain"], value="cover", label="fit")
                 bbc_aspect = gr.Checkbox(
                     value=True,
-                    label="BBC aspect (5:2 fit, compensates gx*5 stretch)",
-                    info=("ON: source is fit to 640x256 (MODE 0 aspect, where "
-                          "the asm now runs) so the on-screen image looks "
-                          "proportional. OFF: 256x256 square fit — image "
-                          "appears stretched 2.5x wider on the BBC."),
+                    label="BBC aspect (5:4 fit, compensates gx*5 stretch)",
+                    info=("ON: source is fit to 320x256 (BBC physical screen "
+                          "aspect, same in MODE 0 and MODE 4) so the on-screen "
+                          "image looks proportional. OFF: 256x256 square fit "
+                          "— image appears stretched 25% wider on the BBC."),
                 )
                 gr.Markdown("### Preprocessing")
                 gamma = gr.Slider(0.2, 4.0, value=1.0, step=0.05, label="gamma (>1 lightens midtones)")
@@ -607,7 +614,7 @@ def build_ui():
                 gr.Markdown("### Radius mapping (cell darkness → pixel radius)")
                 radius_preset = gr.Radio(
                     list(RADIUS_PRESETS.keys()),
-                    value="odd (0,1,3,5)",
+                    value="odd (current BBC: 0,1,3,5)",
                     label="preset (picks one fills the textbox)",
                 )
                 radius_text = gr.Textbox(
@@ -655,11 +662,11 @@ def build_ui():
                 reset_btn = gr.Button("Reset defaults")
             with gr.Column(scale=2):
                 with gr.Row():
-                    lum_out = gr.Image(label="preprocessed luminance (256×256)",
+                    lum_out = gr.Image(label="preprocessed luminance (320×256 BBC aspect / 256×256 square)",
                                        height=300, image_mode="L")
                     cells_out = gr.Image(label="stored cells, upscaled (what BBC sees)",
                                          height=300, image_mode="L")
-                stipple_out = gr.Image(label="R2 stipple output (256×256, BBC orientation)",
+                stipple_out = gr.Image(label="R2 stipple output (320×256, BBC orientation, gx*5 stretch)",
                                        height=520, image_mode="L")
                 info = gr.Markdown()
 
