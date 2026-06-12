@@ -20,7 +20,7 @@ static unsigned char fb1[80 * 256];        // 640x256, 1bpp, MSB-leftmost
 
 // --- 6502 ---
 static unsigned char A, X, Y, S;
-static unsigned short PC;
+static unsigned int PC;
 static unsigned char fN, fZ, fC;
 
 static int g_steps;
@@ -35,26 +35,31 @@ static unsigned char vdu_cmd;
 static unsigned char vdu_pidx;             // params received so far
 static unsigned char vdu_need;             // params still wanted
 static unsigned char vdu_params[5];
-static int g_originX, g_originY;
-static int g_gx, g_gy;                     // graphics cursor (logical, pre-origin)
+static unsigned int g_g;                   // packed cursor: low 16 = gx, high 16 = gy (signed)
 
-static int vdu_needed(unsigned char cmd) {
-    // Number of param bytes after `cmd`. Anything else: zero (treat as no-op).
-    switch (cmd) {
-    case 17: case 22:        return 1;
-    case 18:                 return 2;
-    case 29:                 return 4;
-    case 25:                 return 5;
-    }
-    return 0;
-}
+// Param-byte counts for VDU control codes (cmd < 32). Anything not listed
+// is zero -- harmless no-op for unhandled commands. 32 B of mostly zero
+// compresses to ~5 B; the lookup beats a switch on raw + compressed.
+static const unsigned char kVduParams[32] = {
+    0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,
+    1,    // 17 = COLOUR
+    2,    // 18 = GCOL
+    0,0,0,
+    1,    // 22 = MODE
+    0,0,
+    5,    // 25 = PLOT
+    0,0,0,
+    4,    // 29 = origin
+    0,0,
+};
 
 static inline void set_pixel(int px, int py) {
     if ((unsigned)px < 640 && (unsigned)py < 256)
         fb1[py * 80 + (px >> 3)] |= 0x80 >> (px & 7);
 }
 
-static void plot_filled_circle(int cx_log, int cy_log, int end_x_log) {
+static void plot_filled_circle(int end_x_log) {
+    int cx_log = (short)g_g, cy_log = (short)(g_g >> 16);
     // PLOT 157 (filled circle, abs, fg). Centre = (cx, cy) from preceding
     // MOVE; circumference point = (end_x, cy) (stipple256 always emits at the
     // same Y as the centre). The logical radius `rlog = end_x - cx` is in
@@ -70,22 +75,22 @@ static void plot_filled_circle(int cx_log, int cy_log, int end_x_log) {
     // more tightly vertically — the wide source ellipse counteracts that
     // so clusters don't end up looking like vertical streaks.
     //
-    // Inclusion: `dx²·b² + dy²·a² ≤ a²·b² + a·b` — the `+ a·b` bias is the
-    // ellipse analogue of Bresenham's `+ r` filled-disc bias and rounds out
-    // the perimeter (otherwise small (2,1) ellipses look spiky).
-    int rlog = end_x_log - cx_log;
-    if (rlog < 0) rlog = -rlog;
-    int a = rlog >> 1;                              // X half-axis (pixels)
-    int b = rlog >> 2;                              // Y half-axis (pixels)
-    int cpx = (cx_log + g_originX) >> 1;
-    int cpy = 255 - ((cy_log + g_originY) >> 2);    // Y-flip
-    int a2 = a * a;
-    int b2 = b * b;
-    int bound = a2 * b2 + a * b;
+    // Half-axes are (a, b) = (rlog/2, rlog/4) so a is always 2b. The
+    // canonical ellipse test `dx²·b² + dy²·a² ≤ a²·b² + a·b` with that
+    // substitution and a divide-through by b² collapses to:
+    //     dx² + 4·dy² ≤ 4·b² + 2
+    // which is what we use. The `+ 2` is the simplified Bresenham bias
+    // (originally `+ a/b = +2`); without it small ellipses look spiky.
+    int b = (end_x_log - cx_log) >> 2;              // Y half-axis (pixels)
+    // Origin hardcoded to (130, 0) -- matches the only VDU 29 stipple256
+    // emits. Drops the VDU 29 case entirely and the g_origin* state.
+    int cpx = (cx_log + 130) >> 1;
+    int cpy = 255 - (cy_log >> 2);                  // Y-flip
+    int bound = 4 * b * b + 2;
     for (int dy = -b; dy <= b; ++dy) {
-        int dy2a2 = dy * dy * a2;
-        for (int dx = -a; dx <= a; ++dx) {
-            if (dx * dx * b2 + dy2a2 <= bound)
+        int q = 4 * dy * dy;
+        for (int dx = -2 * b; dx <= 2 * b; ++dx) {
+            if (dx * dx + q <= bound)
                 set_pixel(cpx + dx, cpy + dy);
         }
     }
@@ -97,88 +102,85 @@ static void vdu_dispatch() {
     case 12:                              // CLS -- clear to background (white = 0)
         __stosd((unsigned long*)fb1, 0, (80 * 256) / 4);     // inline rep stosd
         break;
-    case 29:                              // set origin
-        g_originX = (short)(p[0] | (p[1] << 8));
-        g_originY = (short)(p[2] | (p[3] << 8));
-        break;
     case 25: {                            // PLOT k, x, y
-        unsigned char k = p[0];
-        int x = (short)(p[1] | (p[2] << 8));
-        int y = (short)(p[3] | (p[4] << 8));
-        if (k == 4) {                     // MOVE absolute
-            g_gx = x; g_gy = y;
-        } else if (k == 157) {            // filled circle, abs, fg
-            plot_filled_circle(g_gx, g_gy, x);
-        }
+        unsigned int xy = *(unsigned int*)(p + 1);     // xL xH yL yH
+        // PLOT 157 (filled circle, abs, fg): rasterise around the previous
+        // cursor before updating it. MOVE (k=4) just falls through to the
+        // cursor update. Other plot codes act as no-op MOVEs -- fine.
+        if (p[0] == 157) plot_filled_circle((short)xy);
+        g_g = xy;
     } break;
     // 5, 17, 18, 22 -- intentional no-ops (cosmetic state we don't model).
     }
 }
 
 static void vdu(unsigned char a) {
+#if !defined(RELEASE)
     g_oswrch_bytes++;
+#endif
     if (vdu_need) {
         vdu_params[vdu_pidx++] = a;
-        if (--vdu_need == 0) vdu_dispatch();
-        return;
+        --vdu_need;
+    } else {
+        vdu_cmd = a;
+        vdu_pidx = 0;
+        vdu_need = kVduParams[a & 31];
     }
-    vdu_cmd = a;
-    vdu_pidx = 0;
-    vdu_need = (unsigned char)vdu_needed(a);
-    if (vdu_need == 0) vdu_dispatch();
+    if (!vdu_need) vdu_dispatch();
 }
 
 static void cpu_step() {
     unsigned char op = fetch();
     switch (op) {
-    case 0xA9: A = fetch(); setNZ(A); break;
-    case 0xA5: A = ram[fetch()]; setNZ(A); break;
-    case 0xBD: { unsigned short a = fetch16(); A = ram[(unsigned short)(a + X)]; setNZ(A); } break;
-    case 0xB9: { unsigned short a = fetch16(); A = ram[(unsigned short)(a + Y)]; setNZ(A); } break;
+    case 0xA9: setNZ(A = fetch()); break;
+    case 0xA5: setNZ(A = ram[fetch()]); break;
+    case 0xBD: setNZ(A = ram[fetch16() + X]); break;
+    case 0xB9: setNZ(A = ram[fetch16() + Y]); break;
     case 0x85: ram[fetch()] = A; break;
-    case 0xA2: X = fetch(); setNZ(X); break;
-    case 0xA0: Y = fetch(); setNZ(Y); break;
+    case 0xA2: setNZ(X = fetch()); break;
+    case 0xA0: setNZ(Y = fetch()); break;
     case 0x94: ram[(unsigned char)(fetch() + X)] = Y; break;
-    case 0xAA: X = A; setNZ(X); break;
-    case 0xA8: Y = A; setNZ(Y); break;
-    case 0x8A: A = X; setNZ(A); break;
-    case 0x98: A = Y; setNZ(A); break;
-    case 0x0A: fC = A >> 7; A <<= 1; setNZ(A); break;
-    case 0x06: { unsigned char a = fetch(); fC = ram[a] >> 7; ram[a] <<= 1; setNZ(ram[a]); } break;
-    case 0x4A: fC = A & 1; A >>= 1; setNZ(A); break;
+    case 0xAA: setNZ(X = A); break;
+    case 0xA8: setNZ(Y = A); break;
+    case 0x8A: setNZ(A = X); break;
+    case 0x98: setNZ(A = Y); break;
+    case 0x0A: fC = A >> 7; setNZ(A <<= 1); break;
+    case 0x06: { unsigned char a = fetch(); fC = ram[a] >> 7; setNZ(ram[a] <<= 1); } break;
+    case 0x4A: fC = A & 1; setNZ(A >>= 1); break;
     case 0x2A: { unsigned char c0 = fC; fC = A >> 7; A = (A << 1) | c0; setNZ(A); } break;
-    case 0x26: { unsigned char a = fetch(); unsigned char c0 = fC; fC = ram[a] >> 7; ram[a] = (ram[a] << 1) | c0; setNZ(ram[a]); } break;
+    case 0x26: { unsigned char a = fetch(); unsigned char c0 = fC; fC = ram[a] >> 7; setNZ(ram[a] = (ram[a] << 1) | c0); } break;
     case 0x69: { unsigned int r = A + fetch() + fC; fC = (r >> 8) & 1; A = (unsigned char)r; setNZ(A); } break;
     case 0x65: { unsigned int r = A + ram[fetch()] + fC; fC = (r >> 8) & 1; A = (unsigned char)r; setNZ(A); } break;
     case 0xE9: { unsigned int r = A + (fetch() ^ 0xFF) + fC; fC = (r >> 8) & 1; A = (unsigned char)r; setNZ(A); } break;
     case 0x29: A &= fetch(); setNZ(A); break;
     case 0x05: A |= ram[fetch()]; setNZ(A); break;
     case 0x18: fC = 0; break;
-    case 0xE6: { unsigned char a = fetch(); ++ram[a]; setNZ(ram[a]); } break;
-    case 0xC6: { unsigned char a = fetch(); --ram[a]; setNZ(ram[a]); } break;
-    case 0xCA: --X; setNZ(X); break;
-    case 0x88: --Y; setNZ(Y); break;
-    case 0xF0: { signed char d = (signed char)fetch(); if ( fZ) PC = (unsigned short)(PC + d); } break;
-    case 0xD0: { signed char d = (signed char)fetch(); if (!fZ) PC = (unsigned short)(PC + d); } break;
-    case 0x30: { signed char d = (signed char)fetch(); if ( fN) PC = (unsigned short)(PC + d); } break;
-    case 0x10: { signed char d = (signed char)fetch(); if (!fN) PC = (unsigned short)(PC + d); } break;
-    case 0x90: { signed char d = (signed char)fetch(); if (!fC) PC = (unsigned short)(PC + d); } break;
-    case 0x20: { unsigned short a = fetch16(); unsigned short r = (unsigned short)(PC - 1); ram[0x100 + S] = r >> 8; ram[0x100 + (unsigned char)(S - 1)] = r & 0xFF; S -= 2; PC = a; } break;
-    case 0x60: { unsigned char lo = ram[0x100 + (unsigned char)(S + 1)]; unsigned char hi = ram[0x100 + (unsigned char)(S + 2)]; S += 2; PC = (unsigned short)(((hi << 8) | lo) + 1); } break;
-    // 0x12 (KIL/JAM, undocumented) is our OSWRCH trap byte. We plant `12 60`
-    // at $FFEE so `jsr $FFEE` lands here -> we run vdu(A), then the next
-    // fetch picks up the 0x60 (RTS) and returns to caller. Saves the
-    // PC=$FFEE check from the top of cpu_step.
-    case 0x12: vdu(A); break;
-    default: {
+    case 0xE6: setNZ(++ram[fetch()]); break;
+    case 0xC6: setNZ(--ram[fetch()]); break;
+    case 0xCA: setNZ(--X); break;
+    case 0x88: setNZ(--Y); break;
+    case 0xF0: { signed char d = (signed char)fetch(); if ( fZ) PC += d; } break;
+    case 0xD0: { signed char d = (signed char)fetch(); if (!fZ) PC += d; } break;
+    case 0x30: { signed char d = (signed char)fetch(); if ( fN) PC += d; } break;
+    case 0x10: { signed char d = (signed char)fetch(); if (!fN) PC += d; } break;
+    case 0x90: { signed char d = (signed char)fetch(); if (!fC) PC += d; } break;
+    // JSR abs -- if target is $FFEE (OSWRCH) we short-circuit to vdu(A)
+    // without pushing/jumping. Otherwise a normal JSR (stipple256 also does
+    // `jsr emit6`).
+    case 0x20: { unsigned short a = fetch16(); if (a == 0xFFEE) { vdu(A); break; } *(unsigned short*)(ram + 0xFF + S) = PC - 1; S -= 2; PC = a; } break;
+    case 0x60: S += 2; PC = *(unsigned short*)(ram + 0xFF + S) + 1; break;
 #if !defined(RELEASE)
+    default: {
         char msg[128];
         wsprintfA(msg, "UNKNOWN opcode %02X at PC=%04X (step %d)\n", op, (unsigned short)(PC - 1), g_steps);
         DWORD wr; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), msg, lstrlenA(msg), &wr, NULL);
-#endif
         ExitProcess((unsigned)op);
-    }}
+    }
+#endif
+    }
+#if !defined(RELEASE)
     g_steps++;
+#endif
 }
 
 // 1bpp BITMAPINFO with a 2-entry palette. Windows.h's BITMAPINFO has a
@@ -208,11 +210,9 @@ int main()
     HDC hdc = GetDC(hwnd);
 
     // Load stipple256 ROM into emulated RAM at $1900 (inline rep movsb).
+    // We detect `jsr $FFEE` inside case 0x20 and dispatch to vdu(A) without
+    // pushing/jumping -- no trap stub planted in emulated memory.
     __movsb(ram + kStipple256LoadAddr, kStipple256Bin, kStipple256BinLen);
-
-    // OSWRCH trap stub at $FFEE: opcode 0x12 (vdu(A)), then 0x60 (RTS).
-    ram[0xFFEE] = 0x12;
-    ram[0xFFEF] = 0x60;
 
     // Run the 6502 to completion (PC pinned by `beq hang`).
     // A,X,Y,S,fN,fZ,fC are static BSS = already zero; we just need PC.

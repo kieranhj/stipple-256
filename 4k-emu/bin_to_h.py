@@ -6,7 +6,7 @@ Re-run this whenever bbc/stipple256.asm changes. The generated header is
 committed to the repo so the 4k-emu build doesn't require beebasm out of
 the box -- only when you intend to track upstream asm edits.
 """
-import os, sys, pathlib, subprocess
+import sys, pathlib, subprocess
 
 repo = pathlib.Path(__file__).resolve().parent.parent
 bbc = repo / "bbc"
