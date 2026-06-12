@@ -79,7 +79,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
-      <AdditionalOptions>/CRINKLER /COMPMODE:SLOW /UNSAFEIMPORT /UNALIGNCODE /HASHTRIES:1000 /ORDERTRIES:1000 /REPORT:out.html %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/CRINKLER /COMPMODE:SLOW /TINYIMPORT /UNSAFEIMPORT /UNALIGNCODE /HASHTRIES:1000 /ORDERTRIES:1000 /REPORT:out.html %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

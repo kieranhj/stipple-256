@@ -26,9 +26,9 @@ static unsigned char fN, fZ, fC;
 static int g_steps;
 static int g_oswrch_bytes;
 
-static inline void setNZ(unsigned char v) { fZ = (v == 0); fN = (v >> 7) & 1; }
-static inline unsigned char fetch() { return ram[PC++]; }
-static inline unsigned short fetch16() { unsigned short lo = fetch(); return lo | (fetch() << 8); }
+static __forceinline void setNZ(unsigned char v) { fZ = (v == 0); fN = (v >> 7) & 1; }
+static __forceinline unsigned char fetch() { return ram[PC++]; }
+static __forceinline unsigned short fetch16() { unsigned short lo = fetch(); return lo | (fetch() << 8); }
 
 // --- VDU state ---
 static unsigned char vdu_cmd;
@@ -128,16 +128,7 @@ static void vdu(unsigned char a) {
     if (vdu_need == 0) vdu_dispatch();
 }
 
-static void oswrch_trap() {
-    vdu(A);
-    unsigned char lo = ram[0x100 + (unsigned char)(S + 1)];
-    unsigned char hi = ram[0x100 + (unsigned char)(S + 2)];
-    S += 2;
-    PC = (unsigned short)(((hi << 8) | lo) + 1);
-}
-
 static void cpu_step() {
-    if (PC == 0xFFEE) { oswrch_trap(); return; }
     unsigned char op = fetch();
     switch (op) {
     case 0xA9: A = fetch(); setNZ(A); break;
@@ -174,6 +165,11 @@ static void cpu_step() {
     case 0x90: { signed char d = (signed char)fetch(); if (!fC) PC = (unsigned short)(PC + d); } break;
     case 0x20: { unsigned short a = fetch16(); unsigned short r = (unsigned short)(PC - 1); ram[0x100 + S] = r >> 8; ram[0x100 + (unsigned char)(S - 1)] = r & 0xFF; S -= 2; PC = a; } break;
     case 0x60: { unsigned char lo = ram[0x100 + (unsigned char)(S + 1)]; unsigned char hi = ram[0x100 + (unsigned char)(S + 2)]; S += 2; PC = (unsigned short)(((hi << 8) | lo) + 1); } break;
+    // 0x12 (KIL/JAM, undocumented) is our OSWRCH trap byte. We plant `12 60`
+    // at $FFEE so `jsr $FFEE` lands here -> we run vdu(A), then the next
+    // fetch picks up the 0x60 (RTS) and returns to caller. Saves the
+    // PC=$FFEE check from the top of cpu_step.
+    case 0x12: vdu(A); break;
     default: {
 #if !defined(RELEASE)
         char msg[128];
@@ -192,6 +188,14 @@ struct BMI1BPP {
     RGBQUAD pal[2];
 };
 
+// Global, statically initialised. Goes into .data and is correct at PE
+// load time -- no runtime init needed. Crinkler compresses .data tightly
+// (mostly zeros).
+static BMI1BPP gBMI = {
+    { sizeof(BITMAPINFOHEADER), 640, -256, 1, 1, BI_RGB, 0, 0, 0, 0, 0 },
+    { { 0xFF, 0xFF, 0xFF, 0 }, { 0, 0, 0, 0 } },
+};
+
 #if defined(RELEASE)
 int WinMainCRTStartup()
 #else
@@ -203,16 +207,19 @@ int main()
         50, 50, 640, 480, NULL, NULL, NULL, NULL);
     HDC hdc = GetDC(hwnd);
 
-    // Load stipple256 ROM into emulated RAM at $1900.
-    for (int i = 0; i < kStipple256BinLen; ++i)
-        ram[kStipple256LoadAddr + i] = kStipple256Bin[i];
+    // Load stipple256 ROM into emulated RAM at $1900 (inline rep movsb).
+    __movsb(ram + kStipple256LoadAddr, kStipple256Bin, kStipple256BinLen);
+
+    // OSWRCH trap stub at $FFEE: opcode 0x12 (vdu(A)), then 0x60 (RTS).
+    ram[0xFFEE] = 0x12;
+    ram[0xFFEF] = 0x60;
 
     // Run the 6502 to completion (PC pinned by `beq hang`).
-    A = X = Y = 0;
-    S = 0xFD;
-    fN = fZ = fC = 0;
+    // A,X,Y,S,fN,fZ,fC are static BSS = already zero; we just need PC.
+    // S=0xFD is the BBC reset convention but stipple256 doesn't depend on it
+    // (only JSR/RTS use the stack, and they balance regardless of init).
     PC = kStipple256LoadAddr;
-    for (int safety = 0; safety < 10000000; ++safety) {
+    for (;;) {
         unsigned short before = PC;
         cpu_step();
         if (PC == before) break;
@@ -227,23 +234,12 @@ int main()
     }
 #endif
 
-    static BMI1BPP bmi;                          // BSS = zero-init
-    bmi.h.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.h.biWidth = 640;
-    bmi.h.biHeight = -256;
-    bmi.h.biPlanes = 1;
-    bmi.h.biBitCount = 1;
-    bmi.h.biCompression = BI_RGB;
-    bmi.h.biClrUsed = 2;
-    *(unsigned*)&bmi.pal[0] = 0xFFFFFFu;        // index 0 = white
-    // pal[1] = 0 = black (zero-init)
-
-    while (!(GetAsyncKeyState(VK_ESCAPE) & 0x8000)) {
-        MSG msg;
-        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageA(&msg);
-        StretchDIBits(hdc, 0, 0, 640, 480, 0, 0, 640, 256,
-                      fb1, (BITMAPINFO*)&bmi, DIB_RGB_COLORS, SRCCOPY);
-    }
+    // Draw the (already-final) framebuffer once. Note: if the window is
+    // ever obscured by another window, it'll go blank on uncover because
+    // we don't handle WM_PAINT. For a one-shot intro that's acceptable.
+    StretchDIBits(hdc, 0, 0, 640, 480, 0, 0, 640, 256,
+                  fb1, (BITMAPINFO*)&gBMI, DIB_RGB_COLORS, SRCCOPY);
+    while (!(GetAsyncKeyState(VK_ESCAPE) & 0x8000));
     ExitProcess(0);
     return 0;
 }
