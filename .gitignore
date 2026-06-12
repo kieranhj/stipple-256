@@ -11,6 +11,9 @@ bbc/data/.build_tmp/
 bbc/*.lst
 bbc/*.labels
 
+# raw beebasm SAVE output (no -do) -- intermediate for 4k-emu/bin_to_h.py
+bbc/STIP256
+
 # tooling binary (download separately)
 tools/beebasm.exe
 

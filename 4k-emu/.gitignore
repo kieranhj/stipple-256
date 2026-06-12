@@ -1,0 +1,29 @@
+# build artifacts
+Debug/
+Release/
+4k-emu/Debug/
+4k-emu/Release/
+*.iobj
+*.ipdb
+*.pdb
+*.obj
+*.tlog
+*.recipe
+*.idb
+*.ilk
+*.lib
+
+# Crinkler report + crash dumps
+out.html
+dump*.dmp
+
+# diagnostic dumps and screenshots
+fb1_dump.pgm
+fb1_dump.png
+fb1_43.png
+zoom*.png
+*_shot.png
+inspect.ps1
+
+# VS user-state
+*.user
