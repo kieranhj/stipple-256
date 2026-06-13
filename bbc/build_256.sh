@@ -10,6 +10,7 @@
 #                                                        (absolute, repo-relative, or pics/<name>)
 #   ./build_256.sh --run                                 default image, assemble, open .ssd
 #   ./build_256.sh <image> --run                         custom image, assemble, open .ssd
+#   ./build_256.sh --noboot                              skip writing a !BOOT file to the .ssd
 #   ./build_256.sh [<image>] [--run] [extra args ...]    extra args after the image are
 #                                                        passed straight through to
 #                                                        tools/stipple.py --mode256, e.g.
@@ -27,6 +28,7 @@ REPO="$(cd "$BBC_DIR/.." && pwd)"
 # the source image. Everything else is sorted into either --run or
 # stipple.py-passthrough.
 RUN=
+NOBOOT=
 IMG=
 PASSTHROUGH=()
 
@@ -37,6 +39,8 @@ fi
 while [ $# -gt 0 ]; do
     if [ "$1" = "--run" ]; then
         RUN=1
+    elif [ "$1" = "--noboot" ]; then
+        NOBOOT=1
     else
         PASSTHROUGH+=("$1")
     fi
@@ -79,8 +83,13 @@ cd "$BBC_DIR"
 # -dd dumps every global and local label after assembly to LABELS_FILE.
 LIST_FILE="stipple256.lst"
 LABELS_FILE="stipple256.labels"
-out=$(../tools/beebasm.exe -i stipple256.asm -do stipple256.ssd -boot STIP256 \
-        -v -dd -labels "$LABELS_FILE" 2>&1)
+if [ -n "$NOBOOT" ]; then
+    out=$(../tools/beebasm.exe -i stipple256.asm -do stipple256.ssd \
+            -v -dd -labels "$LABELS_FILE" 2>&1)
+else
+    out=$(../tools/beebasm.exe -i stipple256.asm -do stipple256.ssd -boot MONASTP \
+            -v -dd -labels "$LABELS_FILE" 2>&1)
+fi
 # Strip CR (beebasm.exe on win prints CRLF; we want clean LF in the listing).
 printf '%s\n' "$out" | tr -d '\r' > "$LIST_FILE"
 # Also echo to console so existing CI / interactive use keeps working.

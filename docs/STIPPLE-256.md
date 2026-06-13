@@ -271,7 +271,7 @@ python tools/stipple.py --mode256 pics/<image>.png --stem <stem> \
     -o stipple_out -q
 
 cp stipple_out/<stem>_mode256_src.bin bbc/data/mona16.bin
-cd bbc && ../tools/beebasm.exe -i stipple256.asm -do stipple256.ssd -boot STIP256 -v
+cd bbc && ../tools/beebasm.exe -i stipple256.asm -do stipple256.ssd -boot MONASTP -v
 ```
 
 Interactive tuning lives in `tools/stipple_ui.py` (Gradio). The Python preview

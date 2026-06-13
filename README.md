@@ -34,7 +34,8 @@ cd bbc
 ./build_256.sh --run                    # also open the resulting .ssd
 ```
 
-Output: `bbc/stipple256.ssd` (autoboots via `*RUN STIP256`).
+Output: `bbc/stipple256.ssd` (autoboots via `*RUN MONASTP`; pass `--noboot` to
+skip writing the `!BOOT` file).
 
 Requires `tools/beebasm.exe` (not committed — download from
 <https://github.com/stardot/beebasm>) and a Python 3 install with `pillow`,

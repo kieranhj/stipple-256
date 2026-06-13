@@ -10,6 +10,7 @@
 #
 # Usage:
 #   ./build.sh                         # just assemble (uses existing data/parrot.zx02)
+#   ./build.sh --noboot                # assemble without writing a !BOOT file
 #   IMAGE=/path/to/photo.png ./build.sh   # regenerate data from IMAGE, then assemble
 #
 set -euo pipefail
@@ -18,6 +19,13 @@ cd "$(dirname "$0")"
 BEEBASM="${BEEBASM:-beebasm}"
 ZX02="${ZX02:-zx02}"
 STEM="${STEM:-parrot}"
+
+NOBOOT=
+for arg in "$@"; do
+    if [ "$arg" = "--noboot" ]; then
+        NOBOOT=1
+    fi
+done
 
 if [[ -n "${IMAGE:-}" ]]; then
     echo ">> regenerating dot data from $IMAGE"
@@ -30,5 +38,10 @@ if [[ -n "${IMAGE:-}" ]]; then
 fi
 
 echo ">> assembling stipple.asm"
-"$BEEBASM" -i stipple.asm -do stipple.ssd -boot STIPPLE -v | tail -3
-echo ">> built bbc/stipple.ssd  (boot it: SHIFT+BREAK, or *RUN STIPPLE)"
+if [ -n "$NOBOOT" ]; then
+    "$BEEBASM" -i stipple.asm -do stipple.ssd -v | tail -3
+    echo ">> built bbc/stipple.ssd  (no !BOOT; load with *RUN MONASTP)"
+else
+    "$BEEBASM" -i stipple.asm -do stipple.ssd -boot MONASTP -v | tail -3
+    echo ">> built bbc/stipple.ssd  (boot it: SHIFT+BREAK, or *RUN MONASTP)"
+fi

@@ -7,8 +7,8 @@
 ; 16-bit zero-page counter for the 2048-iteration dot loop (X is clobbered by
 ; the image lookup so it can't be the counter).
 ;
-; Build:  ..\tools\beebasm.exe -i stipple256.asm -do stipple256.ssd -boot STIP256 -v
-; Boot:   the SSD autoboots via *RUN STIP256.
+; Build:  ..\tools\beebasm.exe -i stipple256.asm -do stipple256.ssd -boot MONASTP -v
+; Boot:   the SSD autoboots via *RUN MONASTP.
 ;
 ; Source bytes encode darkness (0=light -> r=0 skip; 3=dark -> r=6 max),
 ; LSB-first packed, vertically flipped so the BBC y=0-at-bottom convention
@@ -192,4 +192,4 @@ vdulen = * - vdutab
 
 .prog_end
 
-SAVE "STIP256", start, prog_end, start
+SAVE "MONASTP", start, prog_end, start

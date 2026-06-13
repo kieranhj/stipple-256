@@ -3,7 +3,7 @@
 ; Decompresses a ZX02 dot stream and plots variable-size black dots on a white
 ; MODE 4 (320x256, 1bpp) screen. Built with BeebAsm.
 ;
-;   beebasm -i stipple.asm -do stipple.ssd -boot STIPPLE -v
+;   beebasm -i stipple.asm -do stipple.ssd -boot MONASTP -v
 ;
 ; Data is produced by tools/stipple.py --bbc (see docs/STIPPLE.md for the
 ; stream format). Dot centres are pre-clamped so discs never cross the screen
@@ -256,4 +256,4 @@ INCBIN "data/parrot.zx02"
 
 .prog_end
 
-SAVE "STIPPLE", start, prog_end, start
+SAVE "MONASTP", start, prog_end, start

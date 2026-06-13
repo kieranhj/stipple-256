@@ -194,7 +194,7 @@ cd bbc
 BEEBASM=/path/to/beebasm ZX02=/path/to/zx02 ./build.sh           # assemble only
 IMAGE=/path/to/photo.png BEEBASM=... ZX02=... ./build.sh         # regen + assemble
 ```
-Produces `bbc/stipple.ssd` (auto-boots `STIPPLE`). BeebAsm:
+Produces `bbc/stipple.ssd` (auto-boots `MONASTP`). BeebAsm:
 `github.com/stardot/beebasm`. (Note: the asm INCBINs `data/parrot.zx02`; if you
 change `STEM`, update the `INCBIN` line to match.)
 
